@@ -6,16 +6,19 @@ import uuid
 from collections import defaultdict
 
 import redis
-import requests
+#import requests deprecated, instead use grpc
+import grpc
+import services_pb2
+from grpc_clients import stock_stub, payment_stub
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
 
 DB_ERROR_STR = "DB error"
-REQ_ERROR_STR = "Requests error"
-
-GATEWAY_URL = os.environ['GATEWAY_URL']
+#REQ_ERROR_STR = "Requests error"
+# ^ and v not needed due to gRPC
+#GATEWAY_URL = os.environ['GATEWAY_URL']
 
 app = Flask("order-service")
 
@@ -104,35 +107,45 @@ def find_order(order_id: str):
         }
     )
 
-
-def send_post_request(url: str):
-    try:
-        response = requests.post(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
-
-
-def send_get_request(url: str):
-    try:
-        response = requests.get(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
+# Not needed when using gRPC
+#def send_post_request(url: str):
+#    try:
+#        response = requests.post(url)
+#    except requests.exceptions.RequestException:
+#        abort(400, REQ_ERROR_STR)
+#    else:
+#        return response
+#
+#
+#def send_get_request(url: str):
+#    try:
+#        response = requests.get(url)
+#    except requests.exceptions.RequestException:
+#        abort(400, REQ_ERROR_STR)
+#    else:
+#        return response
 
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
     order_entry: OrderValue = get_order_from_db(order_id)
-    item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
-    if item_reply.status_code != 200:
-        # Request failed because item does not exist
-        abort(400, f"Item: {item_id} does not exist!")
-    item_json: dict = item_reply.json()
+   
+    # Deprecated in gRPC
+    #item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
+    #if item_reply.status_code != 200:
+    #    # Request failed because item does not exist
+    #    abort(400, f"Item: {item_id} does not exist!")
+    #item_json: dict = item_reply.json()
+
+    try:
+        item_reply = stock_stub.FindItem(
+            services_pb2.FindItemRequest(item_id=item_id)
+        )
+    except grpc.RpcError as e:
+        abort(400, f"Item: {item_id} does not exist! [{e.details()}]")
+
     order_entry.items.append((item_id, int(quantity)))
-    order_entry.total_cost += int(quantity) * item_json["price"]
+    order_entry.total_cost += int(quantity) * item_reply.price
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
@@ -143,7 +156,15 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
 def rollback_stock(removed_items: list[tuple[str, int]]):
     for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+        # Deprecated in gRPC
+        #send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+        
+        try:
+            stock_stub.AddStock(
+                services_pb2.AddStockRequest(item_id=item_id, quantity=quantity)
+            )
+        except grpc.RpcError:
+            app.logger.error(f"Rollback failed for item {item_id}")
 
 
 @app.post('/checkout/<order_id>')
@@ -158,14 +179,37 @@ def checkout(order_id: str):
     # for rollback purposes.
     removed_items: list[tuple[str, int]] = []
     for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
+        # Deprecated in gRPC
+        #stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
+        try:
+            stock_reply = stock_stub.SubtractStock(
+                services_pb2.SubtractStockRequest(item_id=item_id, quantity=quantity)
+            )
+        except grpc.RpcError as e:
+            rollback_stock(removed_items)
+            abort(400, "User out of credit")
+        
+        if not stock_reply.success:
             # If one item does not have enough stock we need to rollback
             rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
+            abort(400, "User out of credit")
         removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
+
+    # Deprecated in gRPC
+    #user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
+
+    try:
+        pay_reply = payment_stub.Pay(
+            services_pb2.PayRequest(
+                user_id = order_entry.user_id,
+                amount = order_entry.total_cost,
+            )
+        )
+    except grpc.RpcError as e:
+        rollback_stock(removed_items)
+        abort(400, f"Payment service error: {e.details()}")
+
+    if not pay_reply.success:
         # If the user does not have enough credit we need to rollback all the item stock subtractions
         rollback_stock(removed_items)
         abort(400, "User out of credit")
