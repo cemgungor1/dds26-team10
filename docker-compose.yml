@@ -21,11 +21,59 @@ services:
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      - redis-sentinel-order
 
-  order-db:
+  redis-master-order:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    container_name: redis-master-order
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./master/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+
+  redis-replica1-order:
+    image: redis:7.2-bookworm
+    container_name: redis-replica1-order
+    depends_on:
+      - redis-master-order
+    command: ["redis-server", "--slaveof", "redis-master-order", "6379", "--masterauth", "redis", "--requirepass", "redis"]
+
+  redis-replica2-order:
+    image: redis:7.2-bookworm
+    container_name: redis-replica2-order
+    depends_on:
+      - redis-master-order
+    command: ["redis-server", "--slaveof", "redis-master-order", "6379", "--masterauth", "redis", "--requirepass", "redis"]
+
+  redis-sentinel-order:
+    image: redis:7.2-bookworm
+    container_name: redis-sentinel-order
+    depends_on:
+      - redis-master-order
+      - redis-replica1-order
+      - redis-replica2-order
+    ports:
+      - "26379:26379"
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+        mkdir -p /etc/redis
+        printf "%s\n" \
+          "bind 0.0.0.0" \
+          "protected-mode no" \
+          "port 26379" \
+          "sentinel resolve-hostnames yes" \
+          "sentinel announce-hostnames yes" \
+          "sentinel monitor order-master redis-master-order 6379 1" \
+          "sentinel auth-pass order-master redis" \
+          "sentinel down-after-milliseconds order-master 800" \
+          "sentinel failover-timeout order-master 2000" \
+          > /etc/redis/sentinel.conf
+        exec redis-sentinel /etc/redis/sentinel.conf
+
 
   stock-service:
     build: ./stock
