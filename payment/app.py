@@ -288,10 +288,8 @@ def _start_command_consumer() -> None:
     thread.start()
 
 
-_start_command_consumer()
-
-
 if __name__ == '__main__':
+    _start_command_consumer()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
