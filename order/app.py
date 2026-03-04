@@ -553,10 +553,15 @@ def _start_event_consumer() -> None:
     thread.start()
 
 
-_start_event_consumer()
-_start_outbox_publisher()
+def _start_background_threads() -> None:
+    _start_event_consumer()
+    _start_outbox_publisher()
+    _start_recovery_loop()
 
 
+@app.before_first_request
+def _initialize_background_threads() -> None:
+    _start_background_threads()
 def _recover_sagas_loop() -> None:
     while True:
         try:
