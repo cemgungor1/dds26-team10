@@ -358,12 +358,12 @@ def checkout_sync(order_id: str):
             )
         except grpc.RpcError as e:
             rollback_stock(removed_items)
-            abort(400, "User out of credit")
+            abort(400, f"Stock service error: {e.details()}")
         
         if not stock_reply.success:
             # If one item does not have enough stock we need to rollback
             rollback_stock(removed_items)
-            abort(400, "User out of credit")
+            abort(400, stock_reply.message or "Out of stock")
         removed_items.append((item_id, quantity))
 
     # Deprecated in gRPC
