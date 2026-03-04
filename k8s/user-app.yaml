@@ -10,6 +10,9 @@ spec:
     - port: 5000
       name: http
       targetPort: 5000
+    - port: 50052
+      name: grpc
+      targetPort: 50052
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -36,9 +39,11 @@ spec:
               memory: "1Gi"
               cpu: "1"
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
+          args: ["-c", "gunicorn.conf.py", "-b", "0.0.0.0:5000", "app:app"]
           ports:
             - containerPort: 5000
+            - containerPort: 50052
+              name: grpc
           env:
             - name: KAFKA_BROKERS
               value: "kafka:9092"
