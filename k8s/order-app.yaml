@@ -44,6 +44,12 @@ spec:
               value: "user-service"
             - name: STOCK_SERVICE_URL
               value: "stock-service"
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
+            - name: TRANSACTION_MODE
+              value: "saga"
+            - name: SAGA_TIMEOUT_SECONDS
+              value: "10"
             - name: REDIS_HOST
               value: redis-master
             - name: REDIS_PORT

@@ -40,6 +40,8 @@ spec:
           ports:
             - containerPort: 5000
           env:
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
             - name: REDIS_HOST
               value: redis-master
             - name: REDIS_PORT

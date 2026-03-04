@@ -21,11 +21,15 @@ services:
       - PAYMENT_GRPC_HOST=payment-service
       - PAYMENT_GRPC_PORT=50052
       - GATEWAY_URL=http://gateway:80
+      - KAFKA_BROKERS=kafka:9092
+      - TRANSACTION_MODE=saga
+      - SAGA_TIMEOUT_SECONDS=10
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+      - kafka
 
   order-db:
     image: redis:7.2-bookworm
@@ -35,10 +39,13 @@ services:
     build: ./stock
     image: stock:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - KAFKA_BROKERS=kafka:9092
     env_file:
       - env/stock_redis.env
     depends_on:
       - stock-db
+      - kafka
 
   stock-db:
     image: redis:7.2-bookworm
@@ -48,11 +55,31 @@ services:
     build: ./payment
     image: user:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - KAFKA_BROKERS=kafka:9092
     env_file:
       - env/payment_redis.env
     depends_on:
       - payment-db
+      - kafka
 
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
