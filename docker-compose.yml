@@ -54,7 +54,7 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
       - KAFKA_BROKERS=kafka:9092
     env_file:
