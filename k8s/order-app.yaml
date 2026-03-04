@@ -44,6 +44,14 @@ spec:
               value: "user-service"
             - name: STOCK_SERVICE_URL
               value: "stock-service"
+            - name: STOCK_GRPC_HOST
+              value: "stock-service"
+            - name: STOCK_GRPC_PORT
+              value: "50051"
+            - name: PAYMENT_GRPC_HOST
+              value: "payment-service"
+            - name: PAYMENT_GRPC_PORT
+              value: "50052"
             - name: KAFKA_BROKERS
               value: "kafka:9092"
             - name: TRANSACTION_MODE

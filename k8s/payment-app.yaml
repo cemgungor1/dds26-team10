@@ -1,36 +1,36 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: stock-service
+  name: payment-service
 spec:
   type: ClusterIP
   selector:
-    component: stock
+    component: payment
   ports:
     - port: 5000
       name: http
       targetPort: 5000
-    - port: 50051
+    - port: 50052
       name: grpc
-      targetPort: 50051
+      targetPort: 50052
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: stock-deployment
+  name: payment-deployment
 spec:
   replicas: 1
   selector:
     matchLabels:
-      component: stock
+      component: payment
   template:
     metadata:
       labels:
-        component: stock
+        component: payment
     spec:
       containers:
-        - name: stock
-          image: stock:latest
+        - name: payment
+          image: payment:latest
           resources:
             limits:
               memory: "1Gi"
@@ -39,11 +39,11 @@ spec:
               memory: "1Gi"
               cpu: "1"
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
+          args: ["-c", "gunicorn.conf.py", "-b", "0.0.0.0:5000", "app:app"]
           ports:
             - containerPort: 5000
               name: http
-            - containerPort: 50051
+            - containerPort: 50052
               name: grpc
           env:
             - name: KAFKA_BROKERS
