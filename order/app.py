@@ -439,7 +439,6 @@ def _handle_event(event: dict) -> None:
     message_id = event.get("message_id")
     if not message_id or _event_already_processed(message_id):
         return
-    _mark_event_processed(message_id)
 
     event_type = event.get("type")
     order_id = event.get("order_id")
@@ -457,6 +456,7 @@ def _handle_event(event: dict) -> None:
             state["reason"] = event.get("reason", "Stock reservation failed")
             state["last_update"] = time.time()
             set_saga_state(order_id, state)
+            _mark_event_processed(message_id)
             return
         app.logger.info("Saga %s stock reserved", order_id)
         state["step"] = "charge_payment"
@@ -471,6 +471,7 @@ def _handle_event(event: dict) -> None:
             "timestamp": time.time(),
         }
         _outbox_add(command)
+        _mark_event_processed(message_id)
         app.logger.info("Saga %s charge_payment enqueued %s", order_id, command["message_id"])
         return
 
@@ -490,6 +491,7 @@ def _handle_event(event: dict) -> None:
                 "timestamp": time.time(),
             }
             _outbox_add(command)
+            _mark_event_processed(message_id)
             app.logger.info("Saga %s rollback_stock enqueued %s", order_id, command["message_id"])
             return
         app.logger.info("Saga %s payment succeeded", order_id)
@@ -507,6 +509,7 @@ def _handle_event(event: dict) -> None:
         state["step"] = "done"
         state["last_update"] = time.time()
         set_saga_state(order_id, state)
+        _mark_event_processed(message_id)
         return
 
     if event_type == "StockRolledBack":
@@ -517,6 +520,7 @@ def _handle_event(event: dict) -> None:
         state["step"] = "done"
         state["last_update"] = time.time()
         set_saga_state(order_id, state)
+        _mark_event_processed(message_id)
 
 
 def _event_consumer_loop() -> None:
