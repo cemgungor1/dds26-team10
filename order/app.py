@@ -6,6 +6,7 @@ import uuid
 from collections import defaultdict
 
 import redis
+from redis.exceptions import RedisError
 from redis.sentinel import Sentinel
 import requests
 
@@ -69,8 +70,8 @@ class OrderValue(Struct):
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         # get serialized data
-        entry: bytes = db.get(order_id)
-    except redis.exceptions.RedisError as e:
+        entry: bytes | None = db.get(order_id)
+    except RedisError as e:
         app.logger.exception("Redis error on SET: %s", e)
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
@@ -87,7 +88,7 @@ def create_order(user_id: str):
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         db.set(key, value)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
@@ -114,7 +115,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
@@ -163,7 +164,7 @@ def add_item(order_id: str, item_id: str, quantity: int):
     order_entry.total_cost += int(quantity) * item_json["price"]
     try:
         db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
                     status=200)
@@ -200,7 +201,7 @@ def checkout(order_id: str):
     order_entry.paid = True
     try:
         db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)

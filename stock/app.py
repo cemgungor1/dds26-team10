@@ -4,6 +4,9 @@ import atexit
 import uuid
 
 import redis
+from redis.exceptions import RedisError
+from redis.sentinel import Sentinel
+
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -34,8 +37,8 @@ class StockValue(Struct):
 def get_item_from_db(item_id: str) -> StockValue | None:
     # get serialized data
     try:
-        entry: bytes = db.get(item_id)
-    except redis.exceptions.RedisError:
+        entry: bytes | None = db.get(item_id)
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
     entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
@@ -52,7 +55,7 @@ def create_item(price: int):
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
         db.set(key, value)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
 
@@ -66,7 +69,7 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
 
@@ -89,7 +92,7 @@ def add_stock(item_id: str, amount: int):
     item_entry.stock += int(amount)
     try:
         db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
@@ -104,7 +107,7 @@ def remove_stock(item_id: str, amount: int):
         abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
     try:
         db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
