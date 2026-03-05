@@ -1,6 +1,17 @@
 version: "3"
-services:
 
+x-redis-replica: &redis-replica
+  image: redis:7.2-bookworm
+  command: >
+    sh -lc 'exec redis-server
+      --replicaof "$$MASTER_HOST" "$$MASTER_PORT"
+      --masterauth "$$REDIS_PASSWORD"
+      --requirepass "$$REDIS_PASSWORD"'
+  environment:
+    REDIS_PASSWORD: redis
+    MASTER_PORT: "6379"   # default, can override per service
+
+services:
   gateway:
     image: nginx:1.25-bookworm
     volumes:
@@ -33,18 +44,19 @@ services:
     command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
 
   redis-replica1-order:
-    image: redis:7.2-bookworm
+    <<: *redis-replica
     container_name: redis-replica1-order
-    depends_on:
-      - redis-master-order
-    command: ["redis-server", "--slaveof", "redis-master-order", "6379", "--masterauth", "redis", "--requirepass", "redis"]
+    depends_on: [redis-master-order]
+    environment:
+      MASTER_HOST: redis-master-order
 
   redis-replica2-order:
-    image: redis:7.2-bookworm
+    <<: *redis-replica
     container_name: redis-replica2-order
-    depends_on:
-      - redis-master-order
-    command: ["redis-server", "--slaveof", "redis-master-order", "6379", "--masterauth", "redis", "--requirepass", "redis"]
+    depends_on: [redis-master-order]
+    environment:
+      MASTER_HOST: redis-master-order
+      #MASTER_PORT: "6379"
 
   redis-sentinel-order:
     image: redis:7.2-bookworm
@@ -74,7 +86,6 @@ services:
           > /etc/redis/sentinel.conf
         exec redis-sentinel /etc/redis/sentinel.conf
 
-
   stock-service:
     build: ./stock
     image: stock:latest
@@ -82,11 +93,59 @@ services:
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      - redis-sentinel-stock
 
-  stock-db:
+  redis-master-stock:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    container_name: redis-master-stock
+    #ports:
+    #  - "6379:6379"
+    volumes:
+      - ./master/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+
+  redis-replica1-stock:
+    <<: *redis-replica
+    container_name: redis-replica1-stock
+    depends_on: [redis-master-stock]
+    environment:
+      MASTER_HOST: redis-master-stock
+
+  redis-replica2-stock:
+    <<: *redis-replica
+    container_name: redis-replica2-stock
+    depends_on: [redis-master-stock]
+    environment:
+      MASTER_HOST: redis-master-stock
+      #MASTER_PORT: "6379"
+
+  redis-sentinel-stock:
+    image: redis:7.2-bookworm
+    container_name: redis-sentinel-stock
+    depends_on:
+      - redis-master-stock
+      - redis-replica1-stock
+      - redis-replica2-stock
+    #ports:
+    #  - "26379:26379"
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+        mkdir -p /etc/redis
+        printf "%s\n" \
+          "bind 0.0.0.0" \
+          "protected-mode no" \
+          "port 26379" \
+          "sentinel resolve-hostnames yes" \
+          "sentinel announce-hostnames yes" \
+          "sentinel monitor stock-master redis-master-stock 6379 1" \
+          "sentinel auth-pass stock-master redis" \
+          "sentinel down-after-milliseconds stock-master 800" \
+          "sentinel failover-timeout stock-master 2000" \
+          > /etc/redis/sentinel.conf
+        exec redis-sentinel /etc/redis/sentinel.conf
 
   payment-service:
     build: ./payment
@@ -95,8 +154,56 @@ services:
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      - redis-sentinel-payment
 
-  payment-db:
+  redis-master-payment:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    container_name: redis-master-payment
+    #ports:
+    #  - "6379:6379"
+    volumes:
+      - ./master/redis.conf:/usr/local/etc/redis/redis.conf
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+
+  redis-replica1-payment:
+    <<: *redis-replica
+    container_name: redis-replica1-payment
+    depends_on: [redis-master-payment]
+    environment:
+      MASTER_HOST: redis-master-payment
+
+  redis-replica2-payment:
+    <<: *redis-replica
+    container_name: redis-replica2-payment
+    depends_on: [redis-master-payment]
+    environment:
+      MASTER_HOST: redis-master-payment
+      #MASTER_PORT: "6379"
+
+  redis-sentinel-payment:
+    image: redis:7.2-bookworm
+    container_name: redis-sentinel-payment
+    depends_on:
+      - redis-master-payment
+      - redis-replica1-payment
+      - redis-replica2-payment
+    #ports:
+    #  - "26379:26379"
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+        mkdir -p /etc/redis
+        printf "%s\n" \
+          "bind 0.0.0.0" \
+          "protected-mode no" \
+          "port 26379" \
+          "sentinel resolve-hostnames yes" \
+          "sentinel announce-hostnames yes" \
+          "sentinel monitor payment-master redis-master-payment 6379 1" \
+          "sentinel auth-pass payment-master redis" \
+          "sentinel down-after-milliseconds payment-master 800" \
+          "sentinel failover-timeout payment-master 2000" \
+          > /etc/redis/sentinel.conf
+        exec redis-sentinel /etc/redis/sentinel.conf

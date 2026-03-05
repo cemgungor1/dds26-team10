@@ -14,10 +14,37 @@ DB_ERROR_STR = "DB error"
 
 app = Flask("payment-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+def make_redis_client() -> redis.Redis:
+    # REDIS_SENTINELS="host1:26379,host2:26379"
+    sentinels_raw = os.environ["REDIS_SENTINELS"]
+    sentinel_addrs = []
+    for part in sentinels_raw.split(","):
+        host, port = part.strip().split(":")
+        sentinel_addrs.append((host, int(port)))
+
+    master_name = os.environ["REDIS_MASTER_NAME"]
+    password = os.environ.get("REDIS_PASSWORD")  # password for Redis master/replicas
+    db_index = int(os.environ.get("REDIS_DB", "0"))
+
+    # sentinel_kwargs: auth to talk to Sentinel itself (only needed if you set requirepass for sentinel)
+    # If your sentinel does NOT require auth, leave it empty.
+    sentinel = Sentinel(
+        sentinel_addrs,
+        socket_timeout=1.0,
+        sentinel_kwargs={},  # e.g. {"password": os.environ["SENTINEL_PASSWORD"]}
+    )
+
+    # This returns a Redis client that always targets the CURRENT master.
+    return sentinel.master_for(
+        service_name=master_name,
+        password=password,
+        db=db_index,
+        socket_timeout=1.0,
+        retry_on_timeout=True,
+        decode_responses=False,  # keep bytes because you msgpack encode/decode
+    )
+
+db: redis.Redis = make_redis_client()
 
 
 def close_db_connection():
