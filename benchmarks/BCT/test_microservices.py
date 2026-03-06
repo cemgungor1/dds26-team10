@@ -1,7 +1,94 @@
 import unittest
+import subprocess
+import time
+import requests
+import os.path
 
 import utils as tu
 
+# Path to docker compose
+# Assume you run it in the same directory as the test_microservices.py
+COMPOSE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",))
+
+class TestFailureResilience(unittest.TestCase):
+    def _stop_service(self, service: str):
+        try:
+            subprocess.run(
+                ["docker", "compose", "stop", name],
+                cwd=COMPOSE_DIR,
+                check=True,
+                capture_output=True
+            )
+            time.sleep(3) # Give time to stop full\y
+            print(f"Stopped {service}")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to stop {name}: {e.stderr.decode()}")
+        time.sleep(3) # Give time to stop full\y
+
+    def _start_service(self, service: str):
+        try:
+            subprocess.run(
+                ["docker", "compose", "start", name],
+                cwd=COMPOSE_DIR,
+                check=True,
+                capture_output=True
+            )
+            time.sleep(3) # Give time to stop full\y
+            print(f"Started {service}")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to start {service}: {e.stderr.decode()}")
+
+    def test_stock_service_down(self):
+        # Checkout should fail cleanly when stock service is down
+        user = tu.create_user()
+        tu.add_credit_to_user(user['user_id'], 100)
+        order = tu.create_order(user['user_id'])
+
+        self._stop_service("stock-service")
+        try:
+            response = tu.checkout_order(order['order_id'])
+            # Should be 400
+            self.assertNotEqual(response.status_code, 500)
+            self.assertTrue(tu.status_code_is_failure(response.status_code))
+
+            # Credit must be untouched
+            credit = tu.find_user(user['user_id'])['credit']
+            self.assertEqual(credit, 100)
+        finally:
+            self._start_service("stock-service")
+
+    def test_payment_service_down(self):
+        # Checkout should rollback stock when payment service is down
+        item = tu.create_item(5)
+        tu.add_stock(item['item_id'], 50)
+
+        user = tu.create_user()
+        order = tu.create_order(user['user_id'])
+        tu.add_item_to_order(order['order_id'], item['item_id'], 1)
+
+        stock_before = tu.find_item(item['item_id'])['stock']
+
+        self._stop_service("payment-service")
+        try:
+            response = tu.checkout_order(order['order_id'])
+            self.assertTrue(tu.status_code_is_failure(response.status_code))
+
+            # Stock must be rolled rolledback
+            stock_after = tu.find_item(item['item_id'])['stock']
+            self.assertEqual(stock_after, stock_before)
+        finally:
+            self._start_service("payment-service")
+
+    def test_service_recovers(self):
+        # After service restarts, normal operations must resume correctly
+        self._stop_service("stock-service")
+        self._start_service("stock-service")
+
+        # Full flow work after recovery
+        item = tu.create_item(5)
+        tu.add_stock(item['item_id'], 10)
+        stock = tu.find_item(item['item_id'])['stock']
+        self.assertEqual(stock, 10)
 
 class TestMicroservices(unittest.TestCase):
 
