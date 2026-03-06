@@ -14,7 +14,7 @@ class TestFailureResilience(unittest.TestCase):
     def _stop_service(self, service: str):
         try:
             subprocess.run(
-                ["docker", "compose", "stop", name],
+                ["docker", "compose", "stop", service],
                 cwd=COMPOSE_DIR,
                 check=True,
                 capture_output=True
@@ -22,13 +22,13 @@ class TestFailureResilience(unittest.TestCase):
             time.sleep(3) # Give time to stop full\y
             print(f"Stopped {service}")
         except subprocess.CalledProcessError as e:
-            print(f"Failed to stop {name}: {e.stderr.decode()}")
+            print(f"Failed to stop {service}: {e.stderr.decode()}")
         time.sleep(3) # Give time to stop full\y
 
     def _start_service(self, service: str):
         try:
             subprocess.run(
-                ["docker", "compose", "start", name],
+                ["docker", "compose", "start", service],
                 cwd=COMPOSE_DIR,
                 check=True,
                 capture_output=True
