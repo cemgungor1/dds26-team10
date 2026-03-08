@@ -9,54 +9,53 @@ import uuid
 from collections import defaultdict
 
 import redis
-#import requests deprecated, instead use grpc
 import grpc
 import services_pb2
 from grpc_clients import stock_stub, payment_stub
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+
 try:
     from kafka import KafkaProducer, KafkaConsumer
     from kafka.errors import KafkaError, NoBrokersAvailable
     KAFKA_AVAILABLE = True
-except Exception:  # kafka-python not installed
-    class KafkaProducer:  # type: ignore[dead-code]
+except Exception:
+    class KafkaProducer:
         pass
-
-    class KafkaConsumer:  # type: ignore[dead-code]
+    class KafkaConsumer:
         pass
-
-    KafkaError = Exception  # type: ignore[assignment]
-    NoBrokersAvailable = Exception  # type: ignore[assignment]
+    KafkaError = Exception
+    NoBrokersAvailable = Exception
     KAFKA_AVAILABLE = False
 
 
 DB_ERROR_STR = "DB error"
-#REQ_ERROR_STR = "Requests error"
-# ^ and v not needed due to gRPC
-#GATEWAY_URL = os.environ['GATEWAY_URL']
+
+# Kafka configuration - dedicated in/out queues per service
 KAFKA_BROKERS = os.environ.get("KAFKA_BROKERS", "kafka:9092")
-KAFKA_COMMAND_TOPIC = os.environ.get("KAFKA_COMMAND_TOPIC", "saga-commands")
-KAFKA_EVENT_TOPIC = os.environ.get("KAFKA_EVENT_TOPIC", "saga-events")
+STOCK_COMMAND_TOPIC = os.environ.get("STOCK_COMMAND_TOPIC", "stock-commands")    # out-queue → stock in-queue
+STOCK_EVENT_TOPIC = os.environ.get("STOCK_EVENT_TOPIC", "stock-events")          # stock out-queue → in-queue
+PAYMENT_COMMAND_TOPIC = os.environ.get("PAYMENT_COMMAND_TOPIC", "payment-commands")  # out-queue → payment in-queue
+PAYMENT_EVENT_TOPIC = os.environ.get("PAYMENT_EVENT_TOPIC", "payment-events")        # payment out-queue → in-queue
+
 TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "saga").lower()
 if TRANSACTION_MODE == "saga" and not KAFKA_AVAILABLE:
     TRANSACTION_MODE = "sync"
-SAGA_TIMEOUT_SECONDS = float(os.environ.get("SAGA_TIMEOUT_SECONDS", "10"))
-SAGA_RECOVERY_INTERVAL_SECONDS = float(os.environ.get("SAGA_RECOVERY_INTERVAL_SECONDS", "5"))
-OUTBOX_RETRY_INTERVAL_SECONDS = float(os.environ.get("OUTBOX_RETRY_INTERVAL_SECONDS", "1"))
 
-SAGA_STATE_PREFIX = "saga:"
-SAGA_PROCESSED_EVENTS_SET = "saga:processed_events"
-SAGA_OUTBOX_HASH = "saga:outbox"
-SAGA_IDEMPOTENCY_PREFIX = "saga:idem:"
+SAGA_TIMEOUT_SECONDS = float(os.environ.get("SAGA_TIMEOUT_SECONDS", "10"))
+
+# Redis key prefixes for saga logging
+SAGA_LOG_PREFIX = "saga:log:"
+SAGA_STATE_PREFIX = "saga:state:"
 
 app = Flask("order-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+db: redis.Redis = redis.Redis(
+    host=os.environ['REDIS_HOST'],
+    port=int(os.environ['REDIS_PORT']),
+    password=os.environ['REDIS_PASSWORD'],
+    db=int(os.environ['REDIS_DB']))
 
 
 def close_db_connection():
@@ -75,106 +74,67 @@ class OrderValue(Struct):
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
-        # get serialized data
         entry: bytes = db.get(order_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
-        # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
 
 
-def _saga_state_key(order_id: str) -> str:
-    return f"{SAGA_STATE_PREFIX}{order_id}"
-
-
-def get_saga_state(order_id: str) -> dict | None:
+def _get_order_entry(order_id: str) -> OrderValue | None:
+    """Read order directly from Redis (safe for non-request contexts like Kafka consumer threads)."""
     try:
-        raw = db.get(_saga_state_key(order_id))
+        raw = db.get(order_id)
     except redis.exceptions.RedisError:
         return None
     if not raw:
         return None
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
+        return msgpack.decode(raw, type=OrderValue)
+    except Exception:
         return None
 
 
-def set_saga_state(order_id: str, state: dict) -> None:
+# ─── Saga Log Helpers (log-first approach) ───────────────────────────────────
+
+def _saga_log_key(saga_id: str) -> str:
+    return f"{SAGA_LOG_PREFIX}{saga_id}"
+
+
+def _saga_state_key(saga_id: str) -> str:
+    return f"{SAGA_STATE_PREFIX}{saga_id}"
+
+
+def append_saga_log(saga_id: str, entry: dict) -> None:
+    """Append a log entry to this saga's Redis log list. Called BEFORE the action (log-first)."""
+    entry["saga_id"] = saga_id
+    entry["timestamp"] = time.time()
     try:
-        db.set(_saga_state_key(order_id), json.dumps(state))
+        db.rpush(_saga_log_key(saga_id), json.dumps(entry))
     except redis.exceptions.RedisError:
-        app.logger.error("Failed to persist saga state for %s", order_id)
+        app.logger.error("Failed to append saga log for %s: %s", saga_id, entry)
 
 
-def _event_already_processed(message_id: str) -> bool:
+def get_saga_log(saga_id: str) -> list[dict]:
+    """Retrieve all log entries for a saga."""
     try:
-        return db.sismember(SAGA_PROCESSED_EVENTS_SET, message_id)
+        raw_entries = db.lrange(_saga_log_key(saga_id), 0, -1)
     except redis.exceptions.RedisError:
-        return False
-
-
-def _mark_event_processed(message_id: str) -> None:
-    try:
-        db.sadd(SAGA_PROCESSED_EVENTS_SET, message_id)
-    except redis.exceptions.RedisError:
-        app.logger.error("Failed to mark event processed: %s", message_id)
-
-
-def _outbox_add(command: dict) -> None:
-    message_id = command.get("message_id")
-    if not message_id:
-        return
-    try:
-        db.hset(SAGA_OUTBOX_HASH, message_id, json.dumps(command))
-    except redis.exceptions.RedisError:
-        app.logger.error("Failed to enqueue outbox command %s", message_id)
-
-
-def _outbox_publish_loop() -> None:
-    if not KAFKA_AVAILABLE:
-        return
-    while True:
+        return []
+    entries = []
+    for raw in raw_entries:
         try:
-            entries = db.hgetall(SAGA_OUTBOX_HASH)
-        except redis.exceptions.RedisError:
-            time.sleep(OUTBOX_RETRY_INTERVAL_SECONDS)
+            entries.append(json.loads(raw))
+        except json.JSONDecodeError:
             continue
-        for message_id, raw in entries.items():
-            try:
-                command = json.loads(raw)
-            except json.JSONDecodeError:
-                try:
-                    db.hdel(SAGA_OUTBOX_HASH, message_id)
-                except redis.exceptions.RedisError:
-                    pass
-                continue
-            if _send_command_now(command):
-                try:
-                    db.hdel(SAGA_OUTBOX_HASH, message_id)
-                except redis.exceptions.RedisError:
-                    app.logger.error("Failed to delete outbox command %s", message_id)
-        time.sleep(OUTBOX_RETRY_INTERVAL_SECONDS)
+    return entries
 
 
-def _start_outbox_publisher() -> None:
-    if not KAFKA_AVAILABLE:
-        return
-    thread = threading.Thread(target=_outbox_publish_loop, daemon=True)
-    thread.start()
-
-
-def _idem_key(order_id: str, idem_key: str) -> str:
-    return f"{SAGA_IDEMPOTENCY_PREFIX}{order_id}:{idem_key}"
-
-
-def _get_idempotency_result(order_id: str, idem_key: str) -> dict | None:
+def get_saga_state(saga_id: str) -> dict | None:
     try:
-        raw = db.get(_idem_key(order_id, idem_key))
+        raw = db.get(_saga_state_key(saga_id))
     except redis.exceptions.RedisError:
         return None
     if not raw:
@@ -185,13 +145,14 @@ def _get_idempotency_result(order_id: str, idem_key: str) -> dict | None:
         return None
 
 
-def _set_idempotency_result(order_id: str, idem_key: str, status_code: int, body: str, status: str) -> None:
-    payload = {"status": status, "status_code": status_code, "body": body}
+def set_saga_state(saga_id: str, state: dict) -> None:
     try:
-        db.set(_idem_key(order_id, idem_key), json.dumps(payload))
+        db.set(_saga_state_key(saga_id), json.dumps(state))
     except redis.exceptions.RedisError:
-        app.logger.error("Failed to persist idempotency result for %s", order_id)
+        app.logger.error("Failed to persist saga state for %s", saga_id)
 
+
+# ─── Kafka Producer ──────────────────────────────────────────────────────────
 
 _producer: KafkaProducer | None = None
 
@@ -206,7 +167,7 @@ def get_producer() -> KafkaProducer | None:
                 bootstrap_servers=KAFKA_BROKERS.split(","),
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
                 key_serializer=lambda v: v.encode("utf-8") if v else None,
-                retries=3,
+                retries=3, #Possible tuneable parameter for better resilience in case of transient Kafka issues??
             )
         except NoBrokersAvailable:
             app.logger.warning("Kafka broker unavailable for producer")
@@ -214,19 +175,22 @@ def get_producer() -> KafkaProducer | None:
     return _producer
 
 
-def _send_command_now(command: dict) -> bool:
+def send_to_topic(topic: str, message: dict) -> bool:
+    """Send a message to a specific Kafka topic (service out-queue)."""
     producer = get_producer()
     if producer is None:
         return False
-    key = command.get("order_id")
+    key = message.get("saga_id") or message.get("order_id")
     try:
-        producer.send(KAFKA_COMMAND_TOPIC, value=command, key=key)
+        producer.send(topic, value=message, key=key)
         producer.flush()
     except KafkaError:
-        app.logger.exception("Failed to send saga command")
+        app.logger.exception("Failed to send to topic %s", topic)
         return False
     return True
 
+
+# ─── REST Endpoints ──────────────────────────────────────────────────────────
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
@@ -239,9 +203,9 @@ def create_order(user_id: str):
     return jsonify({'order_id': key})
 
 
+# This endpoint is for testing/demo purposes: it creates n orders with random items and users.
 @app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
 def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
-
     n = int(n)
     n_items = int(n_items)
     n_users = int(n_users)
@@ -251,14 +215,14 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         user_id = random.randint(0, n_users - 1)
         item1_id = random.randint(0, n_items - 1)
         item2_id = random.randint(0, n_items - 1)
-        value = OrderValue(paid=False,
-                           items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
-                           user_id=f"{user_id}",
-                           total_cost=2*item_price)
-        return value
+        return OrderValue(
+            paid=False,
+            items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
+            user_id=f"{user_id}",
+            total_cost=2 * item_price,
+        )
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
-                                  for i in range(n)}
+    kv_pairs = {f"{i}": msgpack.encode(generate_entry()) for i in range(n)}
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
@@ -275,40 +239,14 @@ def find_order(order_id: str):
             "paid": order_entry.paid,
             "items": order_entry.items,
             "user_id": order_entry.user_id,
-            "total_cost": order_entry.total_cost
+            "total_cost": order_entry.total_cost,
         }
     )
-
-# Not needed when using gRPC
-#def send_post_request(url: str):
-#    try:
-#        response = requests.post(url)
-#    except requests.exceptions.RequestException:
-#        abort(400, REQ_ERROR_STR)
-#    else:
-#        return response
-#
-#
-#def send_get_request(url: str):
-#    try:
-#        response = requests.get(url)
-#    except requests.exceptions.RequestException:
-#        abort(400, REQ_ERROR_STR)
-#    else:
-#        return response
 
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
     order_entry: OrderValue = get_order_from_db(order_id)
-   
-    # Deprecated in gRPC
-    #item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
-    #if item_reply.status_code != 200:
-    #    # Request failed because item does not exist
-    #    abort(400, f"Item: {item_id} does not exist!")
-    #item_json: dict = item_reply.json()
-
     try:
         item_reply = stock_stub.FindItem(
             services_pb2.FindItemRequest(item_id=item_id)
@@ -322,15 +260,16 @@ def add_item(order_id: str, item_id: str, quantity: int):
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-                    status=200)
+    return Response(
+        f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
+        status=200,
+    )
 
+
+# ─── Sync Checkout (fallback when Kafka is unavailable) ─────────────────────
 
 def rollback_stock(removed_items: list[tuple[str, int]]):
     for item_id, quantity in removed_items:
-        # Deprecated in gRPC
-        #send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-        
         try:
             stock_stub.AddStock(
                 services_pb2.AddStockRequest(item_id=item_id, quantity=quantity)
@@ -340,89 +279,141 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 
 
 def checkout_sync(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    app.logger.debug(f"Checking out {order_id} (sync mode)")
     order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
+
     removed_items: list[tuple[str, int]] = []
     for item_id, quantity in items_quantities.items():
-        # Deprecated in gRPC
-        #stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
         try:
             stock_reply = stock_stub.SubtractStock(
                 services_pb2.SubtractStockRequest(item_id=item_id, quantity=quantity)
             )
         except grpc.RpcError as e:
             rollback_stock(removed_items)
-            abort(400, "User out of credit")
-        
-        if not stock_reply.success:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, "User out of credit")
-        removed_items.append((item_id, quantity))
+            abort(400, f"Stock error: {e.details()}")
 
-    # Deprecated in gRPC
-    #user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
+        if not stock_reply.success:
+            rollback_stock(removed_items)
+            abort(400, f"Insufficient stock for {item_id}")
+        removed_items.append((item_id, quantity))
 
     try:
         pay_reply = payment_stub.Pay(
-            services_pb2.PayRequest(
-                user_id = order_entry.user_id,
-                amount = order_entry.total_cost,
-            )
+            services_pb2.PayRequest(user_id=order_entry.user_id, amount=order_entry.total_cost)
         )
     except grpc.RpcError as e:
         rollback_stock(removed_items)
         abort(400, f"Payment service error: {e.details()}")
 
     if not pay_reply.success:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
         rollback_stock(removed_items)
         abort(400, "User out of credit")
+
     order_entry.paid = True
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)
 
 
+# ─── Saga Orchestrator ──────────────────────────────────────────────────────
+# The order service is the orchestrator: it drives the saga by sending commands
+# to stock and payment in-queues and reacting to events from their out-queues.
+#
+# Saga steps:
+#   1. ReserveStock  → stock-commands (in-queue)  → StockReserved  (stock-events out-queue)
+#   2. ChargePayment → payment-commands (in-queue) → PaymentCharged (payment-events out-queue)
+#   3. If any step fails → compensate from the beginning:
+#        RollbackPayment (if charged) → RollbackStock → saga failed
+#
+# Every action is logged to Redis BEFORE execution (log-first approach).
+# Each log entry carries the saga_id (= order_id).
+
 def _start_saga(order_id: str, order_entry: OrderValue, items_quantities: dict[str, int]) -> bool:
+    """Start a new saga for the given order. Returns True if saga was started successfully."""
+    saga_id = order_id
+    items = [{"item_id": k, "quantity": v} for k, v in items_quantities.items()]
+
+    # Generate idempotency keys for each step
+    stock_idem_key = str(uuid.uuid4())
+    payment_idem_key = str(uuid.uuid4())
+
+    # Clear previous saga log for this order (restart from the beginning)
+    try:
+        db.delete(_saga_log_key(saga_id))
+    except redis.exceptions.RedisError:
+        pass
+
+    # Initialize saga state
     state = {
+        "saga_id": saga_id,
         "order_id": order_id,
         "user_id": order_entry.user_id,
         "total_cost": order_entry.total_cost,
-        "items": [{"item_id": k, "quantity": v} for k, v in items_quantities.items()],
-        "status": "pending",
+        "items": items,
+        "status": "started",
         "step": "reserve_stock",
-        "compensations": {"stock": "not_started"},
+        "stock_idem_key": stock_idem_key,
+        "payment_idem_key": payment_idem_key,
         "reason": "",
-        "last_update": time.time(),
     }
-    set_saga_state(order_id, state)
+
+    # ── LOG FIRST: record saga start ─────────────────────────────────────
+    append_saga_log(saga_id, {
+        "action": "START_SAGA",
+        "order_id": order_id,
+        "user_id": order_entry.user_id,
+        "total_cost": order_entry.total_cost,
+        "items": items,
+    })
+
+    set_saga_state(saga_id, state)
+
+    # ── LOG FIRST: record the command we are about to send ───────────────
+    append_saga_log(saga_id, {
+        "action": "SEND_RESERVE_STOCK",
+        "items": items,
+        "idempotency_key": stock_idem_key,
+    })
+
+    # ── LOG: compensation plan (what to undo if saga must rollback) ──────
+    append_saga_log(saga_id, {
+        "action": "COMPENSATION_PLAN_STOCK",
+        "items": items,
+        "idempotency_key": stock_idem_key,
+        "description": "Rollback stock reservation for all items",
+    })
+
+    # ── Send command to stock service in-queue ───────────────────────────
     command = {
         "message_id": str(uuid.uuid4()),
         "type": "ReserveStock",
+        "saga_id": saga_id,
         "order_id": order_id,
-        "user_id": order_entry.user_id,
-        "items": state["items"],
-        "timestamp": time.time(),
+        "items": items,
+        "idempotency_key": stock_idem_key,
     }
-    _outbox_add(command)
-    app.logger.info("Saga %s started, command enqueued %s", order_id, command["message_id"])
+
+    if not send_to_topic(STOCK_COMMAND_TOPIC, command):
+        append_saga_log(saga_id, {"action": "FAIL_SAGA", "reason": "Kafka unavailable"})
+        state["status"] = "failed"
+        state["reason"] = "Kafka unavailable"
+        set_saga_state(saga_id, state)
+        return False
+
+    app.logger.info("Saga %s started – ReserveStock sent to stock in-queue", saga_id)
     return True
 
 
-def _wait_for_saga(order_id: str) -> tuple[bool, str]:
+def _wait_for_saga(saga_id: str) -> tuple[bool, str]:
+    """Block until the saga reaches a terminal state or times out."""
     deadline = time.time() + SAGA_TIMEOUT_SECONDS
     while time.time() < deadline:
-        state = get_saga_state(order_id)
+        state = get_saga_state(saga_id)
         if not state:
             time.sleep(0.1)
             continue
@@ -436,88 +427,204 @@ def _wait_for_saga(order_id: str) -> tuple[bool, str]:
 
 
 def _handle_event(event: dict) -> None:
-    message_id = event.get("message_id")
-    if not message_id or _event_already_processed(message_id):
-        return
-    _mark_event_processed(message_id)
+    """Handle events arriving from stock and payment out-queues.
 
+    This runs in the Kafka consumer thread (not a Flask request context),
+    so we must NOT use abort() – access Redis directly instead.
+    """
     event_type = event.get("type")
-    order_id = event.get("order_id")
-    if not order_id:
+    saga_id = event.get("saga_id") or event.get("order_id")
+    if not saga_id:
         return
 
-    state = get_saga_state(order_id)
+    state = get_saga_state(saga_id)
     if not state:
         return
 
+    # ── StockReserved (from stock out-queue) ─────────────────────────────
     if event_type == "StockReserved":
+        append_saga_log(saga_id, {
+            "action": "RECV_STOCK_RESERVED",
+            "success": event.get("success"),
+            "reason": event.get("reason", ""),
+        })
+
         if not event.get("success", False):
-            app.logger.info("Saga %s stock reserve failed: %s", order_id, event.get("reason"))
+            # Stock reservation failed – nothing to compensate
+            app.logger.info("Saga %s stock reserve failed: %s", saga_id, event.get("reason"))
+            append_saga_log(saga_id, {
+                "action": "FAIL_SAGA",
+                "reason": event.get("reason", "Stock reservation failed"),
+            })
             state["status"] = "failed"
             state["reason"] = event.get("reason", "Stock reservation failed")
-            state["last_update"] = time.time()
-            set_saga_state(order_id, state)
+            set_saga_state(saga_id, state)
             return
-        app.logger.info("Saga %s stock reserved", order_id)
+
+        # Stock reserved → proceed to payment
+        app.logger.info("Saga %s stock reserved – proceeding to payment", saga_id)
         state["step"] = "charge_payment"
-        state["last_update"] = time.time()
-        set_saga_state(order_id, state)
+        set_saga_state(saga_id, state)
+
+        # LOG FIRST: about to send payment command
+        append_saga_log(saga_id, {
+            "action": "SEND_CHARGE_PAYMENT",
+            "user_id": state["user_id"],
+            "amount": state["total_cost"],
+            "idempotency_key": state["payment_idem_key"],
+        })
+
+        # LOG: compensation plan for payment
+        append_saga_log(saga_id, {
+            "action": "COMPENSATION_PLAN_PAYMENT",
+            "user_id": state["user_id"],
+            "amount": state["total_cost"],
+            "idempotency_key": state["payment_idem_key"],
+            "description": "Rollback payment charge for user",
+        })
+
+        # Send ChargePayment to payment in-queue
         command = {
             "message_id": str(uuid.uuid4()),
             "type": "ChargePayment",
-            "order_id": order_id,
+            "saga_id": saga_id,
+            "order_id": state["order_id"],
             "user_id": state["user_id"],
             "amount": state["total_cost"],
-            "timestamp": time.time(),
+            "idempotency_key": state["payment_idem_key"],
         }
-        _outbox_add(command)
-        app.logger.info("Saga %s charge_payment enqueued %s", order_id, command["message_id"])
+        send_to_topic(PAYMENT_COMMAND_TOPIC, command)
         return
 
+    # ── PaymentCharged (from payment out-queue) ──────────────────────────
     if event_type == "PaymentCharged":
+        append_saga_log(saga_id, {
+            "action": "RECV_PAYMENT_CHARGED",
+            "success": event.get("success"),
+            "reason": event.get("reason", ""),
+        })
+
         if not event.get("success", False):
-            app.logger.info("Saga %s payment failed: %s", order_id, event.get("reason"))
+            # Payment failed → compensate stock (rollback from the beginning)
+            app.logger.info("Saga %s payment failed: %s – rolling back stock", saga_id, event.get("reason"))
             state["status"] = "compensating"
+            state["step"] = "rollback_stock"
             state["reason"] = event.get("reason", "Payment failed")
-            state["compensations"]["stock"] = "pending"
-            state["last_update"] = time.time()
-            set_saga_state(order_id, state)
+            set_saga_state(saga_id, state)
+
+            append_saga_log(saga_id, {
+                "action": "SEND_ROLLBACK_STOCK",
+                "items": state["items"],
+                "idempotency_key": state["stock_idem_key"],
+            })
+
             command = {
                 "message_id": str(uuid.uuid4()),
                 "type": "RollbackStock",
-                "order_id": order_id,
+                "saga_id": saga_id,
+                "order_id": state["order_id"],
                 "items": state["items"],
-                "timestamp": time.time(),
+                "idempotency_key": state["stock_idem_key"],
             }
-            _outbox_add(command)
-            app.logger.info("Saga %s rollback_stock enqueued %s", order_id, command["message_id"])
+            send_to_topic(STOCK_COMMAND_TOPIC, command)
             return
-        app.logger.info("Saga %s payment succeeded", order_id)
-        try:
-            order_entry: OrderValue = get_order_from_db(order_id)
-            order_entry.paid = True
-            db.set(order_id, msgpack.encode(order_entry))
-        except redis.exceptions.RedisError:
+
+        # Payment succeeded → mark order as paid
+        app.logger.info("Saga %s payment succeeded – completing saga", saga_id)
+        order_entry = _get_order_entry(state["order_id"])
+        if order_entry is None:
+            append_saga_log(saga_id, {"action": "FAIL_SAGA", "reason": "Order not found"})
             state["status"] = "failed"
-            state["reason"] = "Order update failed"
-            state["last_update"] = time.time()
-            set_saga_state(order_id, state)
+            state["reason"] = "Order not found"
+            set_saga_state(saga_id, state)
             return
+
+        order_entry.paid = True
+        try:
+            db.set(state["order_id"], msgpack.encode(order_entry))
+        except redis.exceptions.RedisError:
+            # Order update failed → must compensate both payment and stock
+            app.logger.error("Saga %s order update failed – compensating", saga_id)
+            state["status"] = "compensating"
+            state["step"] = "rollback_payment"
+            state["reason"] = "Order update failed"
+            set_saga_state(saga_id, state)
+
+            append_saga_log(saga_id, {
+                "action": "SEND_ROLLBACK_PAYMENT",
+                "user_id": state["user_id"],
+                "amount": state["total_cost"],
+                "idempotency_key": state["payment_idem_key"],
+            })
+
+            command = {
+                "message_id": str(uuid.uuid4()),
+                "type": "RollbackPayment",
+                "saga_id": saga_id,
+                "order_id": state["order_id"],
+                "user_id": state["user_id"],
+                "amount": state["total_cost"],
+                "idempotency_key": state["payment_idem_key"],
+            }
+            send_to_topic(PAYMENT_COMMAND_TOPIC, command)
+            return
+
+        append_saga_log(saga_id, {"action": "COMPLETE_SAGA"})
         state["status"] = "completed"
         state["step"] = "done"
-        state["last_update"] = time.time()
-        set_saga_state(order_id, state)
+        set_saga_state(saga_id, state)
         return
 
-    if event_type == "StockRolledBack":
-        app.logger.info("Saga %s stock rollback confirmed", order_id)
-        state["status"] = "failed"
-        state["reason"] = state.get("reason", "Rollback completed")
-        state["compensations"]["stock"] = "done"
-        state["step"] = "done"
-        state["last_update"] = time.time()
-        set_saga_state(order_id, state)
+    # ── PaymentRolledBack (from payment out-queue) ───────────────────────
+    if event_type == "PaymentRolledBack":
+        append_saga_log(saga_id, {
+            "action": "RECV_PAYMENT_ROLLED_BACK",
+            "success": event.get("success"),
+        })
 
+        # Payment rolled back → now rollback stock
+        app.logger.info("Saga %s payment rolled back – rolling back stock", saga_id)
+        state["step"] = "rollback_stock"
+        set_saga_state(saga_id, state)
+
+        append_saga_log(saga_id, {
+            "action": "SEND_ROLLBACK_STOCK",
+            "items": state["items"],
+            "idempotency_key": state["stock_idem_key"],
+        })
+
+        command = {
+            "message_id": str(uuid.uuid4()),
+            "type": "RollbackStock",
+            "saga_id": saga_id,
+            "order_id": state["order_id"],
+            "items": state["items"],
+            "idempotency_key": state["stock_idem_key"],
+        }
+        send_to_topic(STOCK_COMMAND_TOPIC, command)
+        return
+
+    # ── StockRolledBack (from stock out-queue) ───────────────────────────
+    if event_type == "StockRolledBack":
+        append_saga_log(saga_id, {
+            "action": "RECV_STOCK_ROLLED_BACK",
+            "success": event.get("success"),
+        })
+
+        # Everything compensated from the beginning → saga failed
+        append_saga_log(saga_id, {
+            "action": "FAIL_SAGA",
+            "reason": state.get("reason", "Compensated and failed"),
+        })
+
+        app.logger.info("Saga %s fully compensated – marking failed", saga_id)
+        state["status"] = "failed"
+        state["step"] = "done"
+        set_saga_state(saga_id, state)
+        return
+
+
+# ─── Kafka Event Consumer (reads from stock & payment out-queues) ────────────
 
 def _event_consumer_loop() -> None:
     if not KAFKA_AVAILABLE:
@@ -525,7 +632,8 @@ def _event_consumer_loop() -> None:
     while True:
         try:
             consumer = KafkaConsumer(
-                KAFKA_EVENT_TOPIC,
+                STOCK_EVENT_TOPIC,
+                PAYMENT_EVENT_TOPIC,
                 bootstrap_servers=KAFKA_BROKERS.split(","),
                 value_deserializer=lambda v: json.loads(v.decode("utf-8")),
                 key_deserializer=lambda v: v.decode("utf-8") if v else None,
@@ -539,10 +647,10 @@ def _event_consumer_loop() -> None:
                 except Exception:
                     app.logger.exception("Failed to handle saga event")
         except NoBrokersAvailable:
-            app.logger.warning("Kafka broker unavailable for event consumer; retrying")
+            app.logger.warning("Kafka unavailable for event consumer; retrying in 1s")
             time.sleep(1.0)
         except Exception:
-            app.logger.exception("Event consumer failed; retrying")
+            app.logger.exception("Event consumer failed; retrying in 1s")
             time.sleep(1.0)
 
 
@@ -553,133 +661,34 @@ def _start_event_consumer() -> None:
     thread.start()
 
 
-def _start_background_threads() -> None:
-    _start_event_consumer()
-    _start_outbox_publisher()
-    _start_recovery_loop()
-
-
-@app.before_first_request
-def _initialize_background_threads() -> None:
-    _start_background_threads()
-def _recover_sagas_loop() -> None:
-    while True:
-        try:
-            cursor = 0
-            pattern = f"{SAGA_STATE_PREFIX}*"
-            while True:
-                cursor, keys = db.scan(cursor=cursor, match=pattern, count=100)
-                for key in keys:
-                    try:
-                        raw = db.get(key)
-                    except redis.exceptions.RedisError:
-                        continue
-                    if not raw:
-                        continue
-                    try:
-                        state = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    status = state.get("status")
-                    order_id = state.get("order_id")
-                    if not order_id:
-                        continue
-                    last_update = float(state.get("last_update", 0))
-                    if time.time() - last_update < SAGA_RECOVERY_INTERVAL_SECONDS:
-                        continue
-                    if status == "pending" and state.get("step") == "reserve_stock":
-                        command = {
-                            "message_id": str(uuid.uuid4()),
-                            "type": "ReserveStock",
-                            "order_id": order_id,
-                            "user_id": state.get("user_id"),
-                            "items": state.get("items", []),
-                            "timestamp": time.time(),
-                        }
-                        _outbox_add(command)
-                        state["last_update"] = time.time()
-                        set_saga_state(order_id, state)
-                    if status == "pending" and state.get("step") == "charge_payment":
-                        command = {
-                            "message_id": str(uuid.uuid4()),
-                            "type": "ChargePayment",
-                            "order_id": order_id,
-                            "user_id": state.get("user_id"),
-                            "amount": state.get("total_cost"),
-                            "timestamp": time.time(),
-                        }
-                        _outbox_add(command)
-                        state["last_update"] = time.time()
-                        set_saga_state(order_id, state)
-                    if status == "compensating" and state.get("compensations", {}).get("stock") != "done":
-                        command = {
-                            "message_id": str(uuid.uuid4()),
-                            "type": "RollbackStock",
-                            "order_id": order_id,
-                            "items": state.get("items", []),
-                            "timestamp": time.time(),
-                        }
-                        _outbox_add(command)
-                        state["last_update"] = time.time()
-                        set_saga_state(order_id, state)
-                if cursor == 0:
-                    break
-        except redis.exceptions.RedisError:
-            pass
-        time.sleep(SAGA_RECOVERY_INTERVAL_SECONDS)
-
-
-def _start_recovery_loop() -> None:
-    thread = threading.Thread(target=_recover_sagas_loop, daemon=True)
-    thread.start()
-
-
-_start_recovery_loop()
-
+# ─── Checkout Endpoint ───────────────────────────────────────────────────────
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
     if TRANSACTION_MODE == "sync":
         return checkout_sync(order_id)
+
     order_entry: OrderValue = get_order_from_db(order_id)
     if order_entry.paid:
         return Response("Order already paid", status=200)
-    idem_key = None
-    try:
-        from flask import request
-        idem_key = request.headers.get("Idempotency-Key")
-    except Exception:
-        idem_key = None
-    if idem_key:
-        existing = _get_idempotency_result(order_id, idem_key)
-        if existing:
-            status = existing.get("status")
-            if status == "completed" or status == "failed":
-                return Response(existing.get("body", ""), status=int(existing.get("status_code", 400)))
-            if status == "in_progress":
-                ok, reason = _wait_for_saga(order_id)
-                if ok:
-                    result = _get_idempotency_result(order_id, idem_key)
-                    if result:
-                        return Response(result.get("body", ""), status=int(result.get("status_code", 400)))
-                return abort(400, "Checkout in progress")
-        _set_idempotency_result(order_id, idem_key, 202, "Checkout in progress", "in_progress")
+
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
+
     if not _start_saga(order_id, order_entry, items_quantities):
-        if idem_key:
-            _set_idempotency_result(order_id, idem_key, 400, "Kafka unavailable", "failed")
-        return abort(400, "Kafka unavailable")
+        return abort(400, "Failed to start saga")
+
     ok, reason = _wait_for_saga(order_id)
     if not ok:
-        if idem_key:
-            _set_idempotency_result(order_id, idem_key, 400, reason, "failed")
         return abort(400, reason)
-    if idem_key:
-        _set_idempotency_result(order_id, idem_key, 200, "Checkout successful", "completed")
+
     return Response("Checkout successful", status=200)
 
+
+# ─── Start Background Threads ────────────────────────────────────────────────
+
+_start_event_consumer()
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
