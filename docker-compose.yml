@@ -3,6 +3,7 @@ services:
 
   gateway:
     image: nginx:1.25-bookworm
+    restart: always
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -15,6 +16,7 @@ services:
   order-service:
     build: ./order
     image: order:latest
+    restart: always
     environment:
       - STOCK_GRPC_HOST=stock-service
       - STOCK_GRPC_PORT=50051
@@ -24,7 +26,7 @@ services:
       - KAFKA_BROKERS=kafka:9092
       - TRANSACTION_MODE=saga
       - SAGA_TIMEOUT_SECONDS=10
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -33,6 +35,7 @@ services:
 
   order-db:
     image: redis:7.2-bookworm
+    restart: always
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     volumes:
       - order-db-data:/data
@@ -40,6 +43,7 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
+    restart: always
     command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
       - KAFKA_BROKERS=kafka:9092
@@ -53,6 +57,7 @@ services:
 
   stock-db:
     image: redis:7.2-bookworm
+    restart: always
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     volumes:
       - stock-db-data:/data
@@ -60,6 +65,7 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
+    restart: always
     command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
       - KAFKA_BROKERS=kafka:9092
@@ -73,18 +79,21 @@ services:
 
   payment-db:
     image: redis:7.2-bookworm
+    restart: always
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     volumes:
       - payment-db-data:/data
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
+    restart: always
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
 
   kafka:
     image: confluentinc/cp-kafka:7.6.1
+    restart: always
     depends_on:
       - zookeeper
     environment:

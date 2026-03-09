@@ -10,6 +10,9 @@ spec:
     - port: 5000
       name: http
       targetPort: 5000
+    - port: 50051
+      name: grpc
+      targetPort: 50051
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -36,17 +39,65 @@ spec:
               memory: "1Gi"
               cpu: "1"
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
+          args: ["-c", "gunicorn.conf.py", "-b", "0.0.0.0:5000", "app:app"]
           ports:
             - containerPort: 5000
+            - containerPort: 50051
           env:
             - name: KAFKA_BROKERS
               value: "kafka:9092"
             - name: REDIS_HOST
-              value: redis-master
+              value: stock-db
             - name: REDIS_PORT
               value: '6379'
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
               value: "0"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stock-db
+spec:
+  type: ClusterIP
+  selector:
+    component: stock-db
+  ports:
+    - port: 6379
+      name: redis
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: stock-db
+spec:
+  serviceName: stock-db
+  replicas: 1
+  selector:
+    matchLabels:
+      component: stock-db
+  template:
+    metadata:
+      labels:
+        component: stock-db
+    spec:
+      containers:
+        - name: stock-db
+          image: redis:7.2-bookworm
+          command: ["redis-server", "--requirepass", "redis", "--appendonly", "yes"]
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: stock-db-data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: stock-db-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 4Gi

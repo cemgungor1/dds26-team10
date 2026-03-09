@@ -298,6 +298,8 @@ def _handle_command(command: dict) -> None:
     command_type = command.get("type")
     order_id = command.get("order_id")
     saga_id = command.get("saga_id") or order_id
+    attempt_id = command.get("attempt_id", "")
+    idem_key = command.get("idempotency_key", order_id)
     items = command.get("items", [])
     if not order_id:
         return
@@ -307,7 +309,7 @@ def _handle_command(command: dict) -> None:
         if _message_processed(message_id):
             return
         app.logger.info("ReserveStock received order_id=%s message_id=%s", order_id, message_id)
-        reserved_key = f"{STOCK_RESERVED_PREFIX}{order_id}"
+        reserved_key = f"{STOCK_RESERVED_PREFIX}{idem_key}"
         try:
             if db.exists(reserved_key):
                 event = {
@@ -315,6 +317,7 @@ def _handle_command(command: dict) -> None:
                     "type": "StockReserved",
                     "saga_id": saga_id,
                     "order_id": order_id,
+                    "attempt_id": attempt_id,
                     "success": True,
                     "reason": "Already reserved",
                     "timestamp": time.time(),
@@ -332,6 +335,7 @@ def _handle_command(command: dict) -> None:
             "type": "StockReserved",
             "saga_id": saga_id,
             "order_id": order_id,
+            "attempt_id": attempt_id,
             "success": ok,
             "reason": reason,
             "timestamp": time.time(),
@@ -345,8 +349,8 @@ def _handle_command(command: dict) -> None:
         if _message_processed(message_id):
             return
         app.logger.info("RollbackStock received order_id=%s message_id=%s", order_id, message_id)
-        rolled_key = f"{STOCK_ROLLEDBACK_PREFIX}{order_id}"
-        reserved_key = f"{STOCK_RESERVED_PREFIX}{order_id}"
+        rolled_key = f"{STOCK_ROLLEDBACK_PREFIX}{idem_key}"
+        reserved_key = f"{STOCK_RESERVED_PREFIX}{idem_key}"
         try:
             if db.exists(rolled_key):
                 event = {
@@ -354,6 +358,7 @@ def _handle_command(command: dict) -> None:
                     "type": "StockRolledBack",
                     "saga_id": saga_id,
                     "order_id": order_id,
+                    "attempt_id": attempt_id,
                     "success": True,
                     "reason": "Already rolled back",
                     "timestamp": time.time(),
@@ -371,6 +376,7 @@ def _handle_command(command: dict) -> None:
             "type": "StockRolledBack",
             "saga_id": saga_id,
             "order_id": order_id,
+            "attempt_id": attempt_id,
             "success": ok,
             "reason": reason,
             "timestamp": time.time(),
@@ -415,10 +421,23 @@ def _start_command_consumer() -> None:
     thread.start()
 
 
-_start_command_consumer()
+_background_services_started = False
+_background_services_lock = threading.Lock()
+
+
+def start_background_services() -> None:
+    global _background_services_started
+    if not KAFKA_AVAILABLE:
+        return
+    with _background_services_lock:
+        if _background_services_started:
+            return
+        _start_command_consumer()
+        _background_services_started = True
 
 
 if __name__ == '__main__':
+    start_background_services()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')

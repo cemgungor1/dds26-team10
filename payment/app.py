@@ -405,10 +405,23 @@ def _start_command_consumer() -> None:
     thread.start()
 
 
-_start_command_consumer()
+_background_services_started = False
+_background_services_lock = threading.Lock()
+
+
+def start_background_services() -> None:
+    global _background_services_started
+    if not KAFKA_AVAILABLE:
+        return
+    with _background_services_lock:
+        if _background_services_started:
+            return
+        _start_command_consumer()
+        _background_services_started = True
 
 
 if __name__ == '__main__':
+    start_background_services()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
