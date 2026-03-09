@@ -2,43 +2,6 @@ syntax = "proto3";
 
 package services;
 
-service StockService 
-{ // Remote Procedure Calls for StockService
-  rpc FindItem (FindItemRequest) returns (FindItemReply);
-  rpc SubtractStock (SubtractStockRequest) returns (StockReply);
-  rpc AddStock (AddStockRequest) returns (StockReply);
-}
-
-message FindItemRequest 
-{ // Using the item_id, create a request
-  string item_id = 1;
-}
-
-message FindItemReply 
-{ // Return the item_id, price and no. stock for item
-  string item_id = 1;
-  int32  price   = 2;
-  int32  stock   = 3;
-}
-
-message SubtractStockRequest 
-{ // Subtract the a no. stocks for an item
-  string item_id  = 1;
-  int32  quantity = 2;
-}
-
-message AddStockRequest 
-{ // Add a no. stocks for an item
-  string item_id  = 1;
-  int32  quantity = 2;
-}
-
-message StockReply 
-{ // Reply back for changes in the stocks
-  bool   success = 1;
-  string message = 2;
-}
-
 service PaymentService 
 { // Remote Procedure Calls for StockService
   rpc Pay (PayRequest) returns (PayReply);
