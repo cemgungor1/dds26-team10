@@ -21,31 +21,43 @@ with open(os.path.join('..', 'urls.json')) as f:
 COMPOSE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 ### Utility functions ###
-def stop_service(name: str):
-    try:
-        subprocess.run(
-            ["docker", "compose", "stop", name],
-            cwd=COMPOSE_DIR,
-            check=True,
-            capture_output=True
-        )
-        time.sleep(2)
-        logger.info(f"Stopped {name}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to stop {name}: {e.stderr.decode()}")
 
-def start_service(name: str):
-    try:
-        subprocess.run(
-            ["docker", "compose", "start", name],
-            cwd=COMPOSE_DIR,
-            check=True,
-            capture_output=True
-        )
-        time.sleep(4)
-        logger.info(f"Started {name}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to start {name}: {e.stderr.decode()}")
+def get_compose_services() -> set[str]:
+    out = subprocess.check_output(
+        ["docker", "ps", "--format", "{{.Names}}"],
+        text=True,
+    )
+    return {s.strip() for s in out.splitlines() if s.strip()}
+
+def resolve_service(service_name: str) -> str:
+    services = get_compose_services()
+    matches = [s for s in services if service_name in s]
+    if len(matches) != 1:
+        raise RuntimeError(f"Could not uniquely resolve '{service_name}' from {services}")
+    return matches[0]
+
+def stop_service(service: str):
+    subprocess.run(
+        ["docker", "stop", service], 
+        cwd=COMPOSE_DIR,
+        check=True
+    )
+    time.sleep(2)
+
+def start_service(service: str):
+    subprocess.run(
+        ["docker", "start", service], 
+        cwd=COMPOSE_DIR,
+        check=True
+    )
+    time.sleep(3)
+
+
+COMPOSE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+STOCK_SERVICE = resolve_service("stock-service")
+PAYMENT_SERVICE = resolve_service("payment-service")
+ORDER_SERVICE = resolve_service("order-service")
 
 ### Basic Tasks ###
 class CreateAndCheckoutOrder(SequentialTaskSet):
@@ -81,7 +93,7 @@ class CheckoutWithStockDown(SequentialTaskSet):
         order_id = random.randint(0, NUMBER_OF_ORDERS - 1)
 
         # Stop the service stock-service
-        stop_service("stock-service")
+        stop_service(STOCK_SERVICE)
         try:
             with self.client.post(
                 f"{ORDER_URL}/orders/checkout/{order_id}",
@@ -106,7 +118,7 @@ class CheckoutWithStockDown(SequentialTaskSet):
                             f"INCONSISTENCY: credit changed during stock outage: {credit}"
                         )
         finally:
-            start_service("stock-service")
+            start_service(STOCK_SERVICE)
 
 class CheckoutWithPaymentDown(SequentialTaskSet):
     # Test to try to checkout while the payment service is down
@@ -138,7 +150,7 @@ class CheckoutWithPaymentDown(SequentialTaskSet):
                 stock_before = r.json().get("stock")
 
         # Stop the payment service
-        stop_service("payment-service")
+        stop_service(PAYMENT_SERVICE)
         try:
             with self.client.post(
                 f"{ORDER_URL}/orders/checkout/{order_id}",
@@ -164,14 +176,14 @@ class CheckoutWithPaymentDown(SequentialTaskSet):
                             f"before={stock_before}, after={stock_after}"
                         )
         finally:
-            start_service("payment-service")
+            start_service(PAYMENT_SERVICE)
 
 class CheckoutAfterRecovery(SequentialTaskSet):
     # Test to see if checkout works the same after stock recovery
     @task
     def stock_recovery_checkout(self):
-        stop_service("stock-service")
-        start_service("stock-service")
+        stop_service(STOCK_SERVICE)
+        start_service(STOCK_SERVICE)
 
         order_id = random.randint(0, NUMBER_OF_ORDERS - 1)
         with self.client.post(
@@ -186,8 +198,8 @@ class CheckoutAfterRecovery(SequentialTaskSet):
 
     @task
     def payment_recovery_checkout(self):
-        stop_service("payment-service")
-        start_service("payment-service")
+        stop_service(PAYMENT_SERVICE)
+        start_service(PAYMENT_SERVICE)
 
         order_id = random.randint(0, NUMBER_OF_ORDERS - 1)
         with self.client.post(
