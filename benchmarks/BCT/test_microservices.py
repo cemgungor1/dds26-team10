@@ -223,7 +223,7 @@ class TestFailureResilience(unittest.TestCase):
         stock = tu.find_item(item['item_id'])['stock']
         self.assertEqual(stock, 10)
 
- class Test2PhaseCommit(unittest.TestCase):
+class Test2PhaseCommit(unittest.TestCase):
     def test_2pc_success_case(self):
         """Test that 2PC successfully commits when all resources are available"""
         # Create user with sufficient credit
