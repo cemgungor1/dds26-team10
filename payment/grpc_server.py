@@ -41,6 +41,26 @@ class PaymentServicer(services_pb2_grpc.PaymentServiceServicer):
 
         return services_pb2.PayReply(success=True, message="OK")
 
+    # gRPC Protobuff version of the HTTP Request - Refund
+    def Refund(self, request, context):
+        try:
+            entry = flask_app.db.get(request.user_id)
+        except redis.exceptions.RedisError:
+            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
+
+        if entry is None:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"User: {request.user_id} not found!")
+
+        user = msgpack.decode(entry, type=flask_app.UserValue)
+        user.credit += request.amount
+
+        try:
+            flask_app.db.set(request.user_id, msgpack.encode(user))
+        except redis.exceptions.RedisError:
+            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
+
+        return services_pb2.PayReply(success=True, message="OK")
+
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     services_pb2_grpc.add_PaymentServiceServicer_to_server(PaymentServicer(), server)

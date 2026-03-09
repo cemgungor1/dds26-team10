@@ -48,6 +48,7 @@ SAGA_TIMEOUT_SECONDS = float(os.environ.get("SAGA_TIMEOUT_SECONDS", "10"))
 # Redis key prefixes for saga logging
 SAGA_LOG_PREFIX = "saga:log:"
 SAGA_STATE_PREFIX = "saga:state:"
+SAGA_LOCK_PREFIX = "saga:lock:"
 
 app = Flask("order-service")
 
@@ -145,11 +146,13 @@ def get_saga_state(saga_id: str) -> dict | None:
         return None
 
 
-def set_saga_state(saga_id: str, state: dict) -> None:
+def set_saga_state(saga_id: str, state: dict) -> bool:
     try:
         db.set(_saga_state_key(saga_id), json.dumps(state))
+        return True
     except redis.exceptions.RedisError:
         app.logger.error("Failed to persist saga state for %s", saga_id)
+        return False
 
 
 # ─── Kafka Producer ──────────────────────────────────────────────────────────
@@ -246,7 +249,7 @@ def find_order(order_id: str):
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
 def add_item(order_id: str, item_id: str, quantity: int):
-    order_entry: OrderValue = get_order_from_db(order_id)
+    quantity = int(quantity)
     try:
         item_reply = stock_stub.FindItem(
             services_pb2.FindItemRequest(item_id=item_id)
@@ -254,16 +257,34 @@ def add_item(order_id: str, item_id: str, quantity: int):
     except grpc.RpcError as e:
         abort(400, f"Item: {item_id} does not exist! [{e.details()}]")
 
-    order_entry.items.append((item_id, int(quantity)))
-    order_entry.total_cost += int(quantity) * item_reply.price
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(
-        f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-        status=200,
-    )
+    # Atomic read-modify-write with guards for paid/in-flight checkout
+    for _attempt in range(5):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(order_id, f"{SAGA_LOCK_PREFIX}{order_id}")
+                raw = pipe.get(order_id)
+                if not raw:
+                    abort(400, f"Order: {order_id} not found!")
+                order_entry = msgpack.decode(raw, type=OrderValue)
+                if order_entry.paid:
+                    pipe.unwatch()
+                    abort(400, f"Order: {order_id} is already paid!")
+                lock_val = pipe.get(f"{SAGA_LOCK_PREFIX}{order_id}")
+                if lock_val:
+                    pipe.unwatch()
+                    abort(400, f"Order: {order_id} checkout is in progress!")
+                order_entry.items.append((item_id, quantity))
+                order_entry.total_cost += quantity * item_reply.price
+                pipe.multi()
+                pipe.set(order_id, msgpack.encode(order_entry))
+                pipe.execute()
+                return Response(
+                    f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
+                    status=200,
+                )
+        except redis.exceptions.WatchError:
+            continue
+    return abort(400, DB_ERROR_STR)
 
 
 # ─── Sync Checkout (fallback when Kafka is unavailable) ─────────────────────
@@ -278,6 +299,7 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
             app.logger.error(f"Rollback failed for item {item_id}")
 
 
+# This is not the main async checkout flow, but a fallback for when TRANSACTION_MODE is set to "sync" (e.g. if Kafka is unavailable). It directly executes the checkout logic in a blocking way without going through the saga orchestration.
 def checkout_sync(order_id: str):
     app.logger.debug(f"Checking out {order_id} (sync mode)")
     order_entry: OrderValue = get_order_from_db(order_id)
@@ -316,6 +338,14 @@ def checkout_sync(order_id: str):
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
+        # Rollback payment and stock on final DB write failure
+        try:
+            payment_stub.Refund(
+                services_pb2.PayRequest(user_id=order_entry.user_id, amount=order_entry.total_cost)
+            )
+        except grpc.RpcError:
+            app.logger.error("Failed to rollback payment during sync checkout for %s", order_id)
+        rollback_stock(removed_items)
         return abort(400, DB_ERROR_STR)
     return Response("Checkout successful", status=200)
 
@@ -338,7 +368,8 @@ def _start_saga(order_id: str, order_entry: OrderValue, items_quantities: dict[s
     saga_id = order_id
     items = [{"item_id": k, "quantity": v} for k, v in items_quantities.items()]
 
-    # Generate idempotency keys for each step
+    # Generate unique attempt ID and idempotency keys for each step
+    attempt_id = str(uuid.uuid4())
     stock_idem_key = str(uuid.uuid4())
     payment_idem_key = str(uuid.uuid4())
 
@@ -352,6 +383,7 @@ def _start_saga(order_id: str, order_entry: OrderValue, items_quantities: dict[s
     state = {
         "saga_id": saga_id,
         "order_id": order_id,
+        "attempt_id": attempt_id,
         "user_id": order_entry.user_id,
         "total_cost": order_entry.total_cost,
         "items": items,
@@ -360,18 +392,22 @@ def _start_saga(order_id: str, order_entry: OrderValue, items_quantities: dict[s
         "stock_idem_key": stock_idem_key,
         "payment_idem_key": payment_idem_key,
         "reason": "",
+        "last_updated": time.time(),
     }
 
     # ── LOG FIRST: record saga start ─────────────────────────────────────
     append_saga_log(saga_id, {
         "action": "START_SAGA",
         "order_id": order_id,
+        "attempt_id": attempt_id,
         "user_id": order_entry.user_id,
         "total_cost": order_entry.total_cost,
         "items": items,
     })
 
-    set_saga_state(saga_id, state)
+    if not set_saga_state(saga_id, state):
+        append_saga_log(saga_id, {"action": "FAIL_SAGA", "reason": "Failed to persist saga state"})
+        return False
 
     # ── LOG FIRST: record the command we are about to send ───────────────
     append_saga_log(saga_id, {
@@ -394,6 +430,7 @@ def _start_saga(order_id: str, order_entry: OrderValue, items_quantities: dict[s
         "type": "ReserveStock",
         "saga_id": saga_id,
         "order_id": order_id,
+        "attempt_id": attempt_id,
         "items": items,
         "idempotency_key": stock_idem_key,
     }
@@ -426,6 +463,15 @@ def _wait_for_saga(saga_id: str) -> tuple[bool, str]:
     return False, "Checkout timed out"
 
 
+def _send_with_retry(topic: str, command: dict, max_retries: int = 3) -> bool:
+    """Send a Kafka message with retries. Returns True on success."""
+    for attempt in range(max_retries):
+        if send_to_topic(topic, command):
+            return True
+        time.sleep(0.2 * (attempt + 1))
+    return False
+
+
 def _handle_event(event: dict) -> None:
     """Handle events arriving from stock and payment out-queues.
 
@@ -441,8 +487,26 @@ def _handle_event(event: dict) -> None:
     if not state:
         return
 
+    # Skip events for sagas already in a terminal state
+    current_status = state.get("status")
+    if current_status in ("completed", "failed"):
+        return
+
+    # Skip events from a different saga attempt (stale events)
+    event_attempt_id = event.get("attempt_id")
+    state_attempt_id = state.get("attempt_id")
+    if event_attempt_id and state_attempt_id and event_attempt_id != state_attempt_id:
+        app.logger.warning("Ignoring stale event from attempt %s (current: %s) for saga %s",
+                          event_attempt_id, state_attempt_id, saga_id)
+        return
+
     # ── StockReserved (from stock out-queue) ─────────────────────────────
     if event_type == "StockReserved":
+        # Step guard: only process if we're waiting for stock reservation
+        if state.get("step") != "reserve_stock":
+            app.logger.warning("Ignoring StockReserved for saga %s in step %s", saga_id, state.get("step"))
+            return
+
         append_saga_log(saga_id, {
             "action": "RECV_STOCK_RESERVED",
             "success": event.get("success"),
@@ -458,12 +522,18 @@ def _handle_event(event: dict) -> None:
             })
             state["status"] = "failed"
             state["reason"] = event.get("reason", "Stock reservation failed")
+            state["last_updated"] = time.time()
             set_saga_state(saga_id, state)
+            try:
+                db.delete(f"{SAGA_LOCK_PREFIX}{state['order_id']}")
+            except redis.exceptions.RedisError:
+                pass
             return
 
         # Stock reserved → proceed to payment
         app.logger.info("Saga %s stock reserved – proceeding to payment", saga_id)
         state["step"] = "charge_payment"
+        state["last_updated"] = time.time()
         set_saga_state(saga_id, state)
 
         # LOG FIRST: about to send payment command
@@ -489,15 +559,23 @@ def _handle_event(event: dict) -> None:
             "type": "ChargePayment",
             "saga_id": saga_id,
             "order_id": state["order_id"],
+            "attempt_id": state.get("attempt_id", ""),
             "user_id": state["user_id"],
             "amount": state["total_cost"],
             "idempotency_key": state["payment_idem_key"],
         }
-        send_to_topic(PAYMENT_COMMAND_TOPIC, command)
+        if not _send_with_retry(PAYMENT_COMMAND_TOPIC, command):
+            app.logger.error("Saga %s failed to send ChargePayment – will retry via recovery", saga_id)
+            # Leave state as charge_payment; the recovery thread will re-send
         return
 
     # ── PaymentCharged (from payment out-queue) ──────────────────────────
     if event_type == "PaymentCharged":
+        # Step guard: only process if we're waiting for payment
+        if state.get("step") != "charge_payment":
+            app.logger.warning("Ignoring PaymentCharged for saga %s in step %s", saga_id, state.get("step"))
+            return
+
         append_saga_log(saga_id, {
             "action": "RECV_PAYMENT_CHARGED",
             "success": event.get("success"),
@@ -510,6 +588,7 @@ def _handle_event(event: dict) -> None:
             state["status"] = "compensating"
             state["step"] = "rollback_stock"
             state["reason"] = event.get("reason", "Payment failed")
+            state["last_updated"] = time.time()
             set_saga_state(saga_id, state)
 
             append_saga_log(saga_id, {
@@ -523,20 +602,44 @@ def _handle_event(event: dict) -> None:
                 "type": "RollbackStock",
                 "saga_id": saga_id,
                 "order_id": state["order_id"],
+                "attempt_id": state.get("attempt_id", ""),
                 "items": state["items"],
                 "idempotency_key": state["stock_idem_key"],
             }
-            send_to_topic(STOCK_COMMAND_TOPIC, command)
+            if not _send_with_retry(STOCK_COMMAND_TOPIC, command):
+                app.logger.error("Saga %s failed to send RollbackStock – will retry via recovery", saga_id)
             return
 
         # Payment succeeded → mark order as paid
         app.logger.info("Saga %s payment succeeded – completing saga", saga_id)
         order_entry = _get_order_entry(state["order_id"])
         if order_entry is None:
-            append_saga_log(saga_id, {"action": "FAIL_SAGA", "reason": "Order not found"})
-            state["status"] = "failed"
-            state["reason"] = "Order not found"
+            # Order not found – must compensate both payment and stock
+            app.logger.error("Saga %s order not found – compensating", saga_id)
+            state["status"] = "compensating"
+            state["step"] = "rollback_payment"
+            state["reason"] = "Order not found after payment"
+            state["last_updated"] = time.time()
             set_saga_state(saga_id, state)
+
+            append_saga_log(saga_id, {
+                "action": "SEND_ROLLBACK_PAYMENT",
+                "user_id": state["user_id"],
+                "amount": state["total_cost"],
+            })
+
+            command = {
+                "message_id": str(uuid.uuid4()),
+                "type": "RollbackPayment",
+                "saga_id": saga_id,
+                "order_id": state["order_id"],
+                "attempt_id": state.get("attempt_id", ""),
+                "user_id": state["user_id"],
+                "amount": state["total_cost"],
+                "idempotency_key": state["payment_idem_key"],
+            }
+            if not _send_with_retry(PAYMENT_COMMAND_TOPIC, command):
+                app.logger.error("Saga %s failed to send RollbackPayment – will retry via recovery", saga_id)
             return
 
         order_entry.paid = True
@@ -548,6 +651,7 @@ def _handle_event(event: dict) -> None:
             state["status"] = "compensating"
             state["step"] = "rollback_payment"
             state["reason"] = "Order update failed"
+            state["last_updated"] = time.time()
             set_saga_state(saga_id, state)
 
             append_saga_log(saga_id, {
@@ -562,29 +666,58 @@ def _handle_event(event: dict) -> None:
                 "type": "RollbackPayment",
                 "saga_id": saga_id,
                 "order_id": state["order_id"],
+                "attempt_id": state.get("attempt_id", ""),
                 "user_id": state["user_id"],
                 "amount": state["total_cost"],
                 "idempotency_key": state["payment_idem_key"],
             }
-            send_to_topic(PAYMENT_COMMAND_TOPIC, command)
+            if not _send_with_retry(PAYMENT_COMMAND_TOPIC, command):
+                app.logger.error("Saga %s failed to send RollbackPayment – will retry via recovery", saga_id)
             return
 
         append_saga_log(saga_id, {"action": "COMPLETE_SAGA"})
         state["status"] = "completed"
         state["step"] = "done"
+        state["last_updated"] = time.time()
         set_saga_state(saga_id, state)
+        try:
+            db.delete(f"{SAGA_LOCK_PREFIX}{state['order_id']}")
+        except redis.exceptions.RedisError:
+            pass
         return
 
     # ── PaymentRolledBack (from payment out-queue) ───────────────────────
     if event_type == "PaymentRolledBack":
+        if state.get("step") != "rollback_payment":
+            app.logger.warning("Ignoring PaymentRolledBack for saga %s in step %s", saga_id, state.get("step"))
+            return
+
         append_saga_log(saga_id, {
             "action": "RECV_PAYMENT_ROLLED_BACK",
             "success": event.get("success"),
         })
 
+        if not event.get("success", False):
+            # Payment rollback failed – retry
+            app.logger.error("Saga %s payment rollback failed: %s – retrying", saga_id, event.get("reason", ""))
+            command = {
+                "message_id": str(uuid.uuid4()),
+                "type": "RollbackPayment",
+                "saga_id": saga_id,
+                "order_id": state["order_id"],
+                "attempt_id": state.get("attempt_id", ""),
+                "user_id": state["user_id"],
+                "amount": state["total_cost"],
+                "idempotency_key": state["payment_idem_key"],
+            }
+            if not _send_with_retry(PAYMENT_COMMAND_TOPIC, command):
+                app.logger.error("Saga %s failed to re-send RollbackPayment", saga_id)
+            return
+
         # Payment rolled back → now rollback stock
         app.logger.info("Saga %s payment rolled back – rolling back stock", saga_id)
         state["step"] = "rollback_stock"
+        state["last_updated"] = time.time()
         set_saga_state(saga_id, state)
 
         append_saga_log(saga_id, {
@@ -598,18 +731,40 @@ def _handle_event(event: dict) -> None:
             "type": "RollbackStock",
             "saga_id": saga_id,
             "order_id": state["order_id"],
+            "attempt_id": state.get("attempt_id", ""),
             "items": state["items"],
             "idempotency_key": state["stock_idem_key"],
         }
-        send_to_topic(STOCK_COMMAND_TOPIC, command)
+        if not _send_with_retry(STOCK_COMMAND_TOPIC, command):
+            app.logger.error("Saga %s failed to send RollbackStock – will retry via recovery", saga_id)
         return
 
     # ── StockRolledBack (from stock out-queue) ───────────────────────────
     if event_type == "StockRolledBack":
+        if state.get("step") != "rollback_stock":
+            app.logger.warning("Ignoring StockRolledBack for saga %s in step %s", saga_id, state.get("step"))
+            return
+
         append_saga_log(saga_id, {
             "action": "RECV_STOCK_ROLLED_BACK",
             "success": event.get("success"),
         })
+
+        if not event.get("success", False):
+            # Stock rollback failed – retry
+            app.logger.error("Saga %s stock rollback failed: %s – retrying", saga_id, event.get("reason", ""))
+            command = {
+                "message_id": str(uuid.uuid4()),
+                "type": "RollbackStock",
+                "saga_id": saga_id,
+                "order_id": state["order_id"],
+                "attempt_id": state.get("attempt_id", ""),
+                "items": state["items"],
+                "idempotency_key": state["stock_idem_key"],
+            }
+            if not _send_with_retry(STOCK_COMMAND_TOPIC, command):
+                app.logger.error("Saga %s failed to re-send RollbackStock", saga_id)
+            return
 
         # Everything compensated from the beginning → saga failed
         append_saga_log(saga_id, {
@@ -620,7 +775,12 @@ def _handle_event(event: dict) -> None:
         app.logger.info("Saga %s fully compensated – marking failed", saga_id)
         state["status"] = "failed"
         state["step"] = "done"
+        state["last_updated"] = time.time()
         set_saga_state(saga_id, state)
+        try:
+            db.delete(f"{SAGA_LOCK_PREFIX}{state['order_id']}")
+        except redis.exceptions.RedisError:
+            pass
         return
 
 
@@ -639,11 +799,12 @@ def _event_consumer_loop() -> None:
                 key_deserializer=lambda v: v.decode("utf-8") if v else None,
                 group_id="order-saga-events",
                 auto_offset_reset="earliest",
-                enable_auto_commit=True,
+                enable_auto_commit=False,
             )
             for message in consumer:
                 try:
                     _handle_event(message.value)
+                    consumer.commit()
                 except Exception:
                     app.logger.exception("Failed to handle saga event")
         except NoBrokersAvailable:
@@ -661,10 +822,119 @@ def _start_event_consumer() -> None:
     thread.start()
 
 
+# ─── Saga Recovery Thread ────────────────────────────────────────────────────
+# Periodically scans for sagas stuck in non-terminal states and re-sends the
+# appropriate command. This handles cases where a Kafka send failed silently,
+# a consumer crashed after processing but before sending a response, etc.
+
+SAGA_RECOVERY_INTERVAL = float(os.environ.get("SAGA_RECOVERY_INTERVAL", "5"))
+SAGA_STALE_THRESHOLD = float(os.environ.get("SAGA_STALE_THRESHOLD", "8"))
+
+
+def _recover_saga(saga_id: str, state: dict) -> None:
+    """Re-send the appropriate command based on current saga step."""
+    step = state.get("step")
+    order_id = state.get("order_id")
+    attempt_id = state.get("attempt_id", "")
+    app.logger.info("Recovering saga %s stuck at step=%s", saga_id, step)
+
+    if step == "reserve_stock":
+        command = {
+            "message_id": str(uuid.uuid4()),
+            "type": "ReserveStock",
+            "saga_id": saga_id,
+            "order_id": order_id,
+            "attempt_id": attempt_id,
+            "items": state["items"],
+            "idempotency_key": state["stock_idem_key"],
+        }
+        _send_with_retry(STOCK_COMMAND_TOPIC, command)
+
+    elif step == "charge_payment":
+        command = {
+            "message_id": str(uuid.uuid4()),
+            "type": "ChargePayment",
+            "saga_id": saga_id,
+            "order_id": order_id,
+            "attempt_id": attempt_id,
+            "user_id": state["user_id"],
+            "amount": state["total_cost"],
+            "idempotency_key": state["payment_idem_key"],
+        }
+        _send_with_retry(PAYMENT_COMMAND_TOPIC, command)
+
+    elif step == "rollback_payment":
+        command = {
+            "message_id": str(uuid.uuid4()),
+            "type": "RollbackPayment",
+            "saga_id": saga_id,
+            "order_id": order_id,
+            "attempt_id": attempt_id,
+            "user_id": state["user_id"],
+            "amount": state["total_cost"],
+            "idempotency_key": state["payment_idem_key"],
+        }
+        _send_with_retry(PAYMENT_COMMAND_TOPIC, command)
+
+    elif step == "rollback_stock":
+        command = {
+            "message_id": str(uuid.uuid4()),
+            "type": "RollbackStock",
+            "saga_id": saga_id,
+            "order_id": order_id,
+            "attempt_id": attempt_id,
+            "items": state["items"],
+            "idempotency_key": state["stock_idem_key"],
+        }
+        _send_with_retry(STOCK_COMMAND_TOPIC, command)
+
+    # Update last_updated so we don't immediately retry again
+    state["last_updated"] = time.time()
+    set_saga_state(saga_id, state)
+
+
+def _saga_recovery_loop() -> None:
+    """Background loop that scans for stuck sagas and recovers them."""
+    if not KAFKA_AVAILABLE:
+        return
+    while True:
+        try:
+            time.sleep(SAGA_RECOVERY_INTERVAL)
+            now = time.time()
+            # Scan all saga state keys
+            for key in db.scan_iter(match=f"{SAGA_STATE_PREFIX}*", count=100):
+                try:
+                    raw = db.get(key)
+                    if not raw:
+                        continue
+                    state = json.loads(raw)
+                    status = state.get("status")
+                    if status in ("completed", "failed"):
+                        continue
+                    last_updated = state.get("last_updated", 0)
+                    if now - last_updated > SAGA_STALE_THRESHOLD:
+                        saga_id = state.get("saga_id")
+                        if saga_id:
+                            _recover_saga(saga_id, state)
+                except Exception:
+                    app.logger.exception("Error recovering saga from key %s", key)
+        except Exception:
+            app.logger.exception("Saga recovery loop error")
+            time.sleep(SAGA_RECOVERY_INTERVAL)
+
+
+def _start_saga_recovery() -> None:
+    if not KAFKA_AVAILABLE:
+        return
+    thread = threading.Thread(target=_saga_recovery_loop, daemon=True)
+    thread.start()
+
+
 # ─── Checkout Endpoint ───────────────────────────────────────────────────────
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
+    # Sync fallback when Kafka is unavailable
     if TRANSACTION_MODE == "sync":
         return checkout_sync(order_id)
 
@@ -672,14 +942,49 @@ def checkout(order_id: str):
     if order_entry.paid:
         return Response("Order already paid", status=200)
 
+    # ── Prevent concurrent checkout on the same order ────────────────────
+    saga_lock_key = f"{SAGA_LOCK_PREFIX}{order_id}"
+    lock_ttl = max(int(SAGA_TIMEOUT_SECONDS) * 5, 60)
+    try:
+        acquired = db.set(saga_lock_key, "1", nx=True, ex=lock_ttl)
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+
+    if not acquired:
+        # Check if a previous saga is still active
+        state = get_saga_state(order_id)
+        if state and state.get("status") not in ("completed", "failed"):
+            return abort(400, "Checkout already in progress for this order")
+        # Previous saga finished — release stale lock and retry once
+        try:
+            db.delete(saga_lock_key)
+            acquired = db.set(saga_lock_key, "1", nx=True, ex=lock_ttl)
+        except redis.exceptions.RedisError:
+            return abort(400, DB_ERROR_STR)
+        if not acquired:
+            return abort(400, "Checkout already in progress for this order")
+
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
 
     if not _start_saga(order_id, order_entry, items_quantities):
+        try:
+            db.delete(saga_lock_key)
+        except redis.exceptions.RedisError:
+            pass
         return abort(400, "Failed to start saga")
 
     ok, reason = _wait_for_saga(order_id)
+
+    # Only release lock if saga reached terminal state
+    state = get_saga_state(order_id)
+    if state and state.get("status") in ("completed", "failed"):
+        try:
+            db.delete(saga_lock_key)
+        except redis.exceptions.RedisError:
+            pass
+
     if not ok:
         return abort(400, reason)
 
@@ -689,6 +994,7 @@ def checkout(order_id: str):
 # ─── Start Background Threads ────────────────────────────────────────────────
 
 _start_event_consumer()
+_start_saga_recovery()
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)

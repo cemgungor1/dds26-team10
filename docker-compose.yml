@@ -33,7 +33,9 @@ services:
 
   order-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - order-db-data:/data
 
   stock-service:
     build: ./stock
@@ -41,6 +43,8 @@ services:
     command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
       - KAFKA_BROKERS=kafka:9092
+      - KAFKA_COMMAND_TOPIC=stock-commands
+      - KAFKA_EVENT_TOPIC=stock-events
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -49,7 +53,9 @@ services:
 
   stock-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - stock-db-data:/data
 
   payment-service:
     build: ./payment
@@ -57,6 +63,8 @@ services:
     command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
       - KAFKA_BROKERS=kafka:9092
+      - KAFKA_COMMAND_TOPIC=payment-commands
+      - KAFKA_EVENT_TOPIC=payment-events
     env_file:
       - env/payment_redis.env
     depends_on:
@@ -65,7 +73,9 @@ services:
 
   payment-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - payment-db-data:/data
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
@@ -83,3 +93,8 @@ services:
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+volumes:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:

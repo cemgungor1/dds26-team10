@@ -27,10 +27,11 @@ except Exception:  # kafka-python not installed
 
 DB_ERROR_STR = "DB error"
 KAFKA_BROKERS = os.environ.get("KAFKA_BROKERS", "kafka:9092")
-KAFKA_COMMAND_TOPIC = os.environ.get("KAFKA_COMMAND_TOPIC", "saga-commands")
-KAFKA_EVENT_TOPIC = os.environ.get("KAFKA_EVENT_TOPIC", "saga-events")
+KAFKA_COMMAND_TOPIC = os.environ.get("KAFKA_COMMAND_TOPIC", "payment-commands")
+KAFKA_EVENT_TOPIC = os.environ.get("KAFKA_EVENT_TOPIC", "payment-events")
 PROCESSED_MESSAGES_SET = "payment:processed_messages"
 PAYMENT_CHARGED_PREFIX = "payment:charged:"
+PAYMENT_ROLLEDBACK_PREFIX = "payment:rolledback:"
 
 
 app = Flask("payment-service")
@@ -165,93 +166,208 @@ def find_user(user_id: str):
 
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit += int(amount)
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    amount = int(amount)
+    for _attempt in range(5):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id)
+                raw = pipe.get(user_id)
+                if not raw:
+                    abort(400, f"User: {user_id} not found!")
+                user_entry = msgpack.decode(raw, type=UserValue)
+                user_entry.credit += amount
+                pipe.multi()
+                pipe.set(user_id, msgpack.encode(user_entry))
+                pipe.execute()
+                return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+        except redis.exceptions.WatchError:
+            continue
+    return abort(400, DB_ERROR_STR)
 
 
 @app.post('/pay/<user_id>/<amount>')
 def remove_credit(user_id: str, amount: int):
-    app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
-        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    amount = int(amount)
+    for _attempt in range(5):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id)
+                raw = pipe.get(user_id)
+                if not raw:
+                    abort(400, f"User: {user_id} not found!")
+                user_entry = msgpack.decode(raw, type=UserValue)
+                user_entry.credit -= amount
+                if user_entry.credit < 0:
+                    pipe.unwatch()
+                    abort(400, f"User: {user_id} credit cannot get reduced below zero!")
+                pipe.multi()
+                pipe.set(user_id, msgpack.encode(user_entry))
+                pipe.execute()
+                return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+        except redis.exceptions.WatchError:
+            continue
+    return abort(400, DB_ERROR_STR)
 
 
-def _charge_payment(user_id: str, amount: int) -> tuple[bool, str]:
-    user_entry = _get_user_entry(user_id)
-    if user_entry is None:
-        return False, "User not found"
-    user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
-        return False, "User out of credit"
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return False, "DB error"
-    return True, ""
+def _charge_payment(user_id: str, amount: int, charged_key: str) -> tuple[bool, str]:
+    """Atomically deduct credit and set the idempotency marker in one Redis transaction."""
+    amount = int(amount)
+    retries = 3
+    while retries > 0:
+        retries -= 1
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id)
+                user_entry = _get_user_entry(user_id)
+                if user_entry is None:
+                    pipe.unwatch()
+                    return False, "User not found"
+                user_entry.credit -= amount
+                if user_entry.credit < 0:
+                    pipe.unwatch()
+                    return False, "User out of credit"
+                pipe.multi()
+                pipe.set(user_id, msgpack.encode(user_entry))
+                pipe.set(charged_key, json.dumps({"user_id": user_id, "amount": amount}))
+                pipe.execute()
+                return True, ""
+        except redis.exceptions.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return False, "DB error"
+    return False, "Concurrent modification"
+
+
+def _rollback_payment(user_id: str, amount: int, rolled_key: str, charged_key: str) -> tuple[bool, str]:
+    """Atomically refund credit and set rollback marker in one Redis transaction."""
+    amount = int(amount)
+    retries = 3
+    while retries > 0:
+        retries -= 1
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id)
+                user_entry = _get_user_entry(user_id)
+                if user_entry is None:
+                    pipe.unwatch()
+                    return False, "User not found"
+                user_entry.credit += amount
+                pipe.multi()
+                pipe.set(user_id, msgpack.encode(user_entry))
+                pipe.set(rolled_key, "1")
+                pipe.delete(charged_key)
+                pipe.execute()
+                return True, ""
+        except redis.exceptions.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return False, "DB error"
+    return False, "Concurrent modification"
 
 
 def _handle_command(command: dict) -> None:
     message_id = command.get("message_id")
-    if not message_id or _message_processed(message_id):
-        return
-    _mark_message_processed(message_id)
-
-    if command.get("type") != "ChargePayment":
+    if not message_id:
         return
 
+    command_type = command.get("type")
     order_id = command.get("order_id")
+    saga_id = command.get("saga_id") or order_id
     user_id = command.get("user_id")
     amount = command.get("amount")
-    if not order_id or user_id is None or amount is None:
-        return
-    app.logger.info("ChargePayment received order_id=%s message_id=%s", order_id, message_id)
 
-    charged_key = f"{PAYMENT_CHARGED_PREFIX}{order_id}"
-    try:
-        if db.exists(charged_key):
-            event = {
-                "message_id": str(uuid.uuid4()),
-                "type": "PaymentCharged",
-                "order_id": order_id,
-                "success": True,
-                "reason": "Already charged",
-                "timestamp": time.time(),
-            }
-            send_event(event)
+    # ── ChargePayment ────────────────────────────────────────────────────
+    if command_type == "ChargePayment":
+        if _message_processed(message_id):
             return
-    except redis.exceptions.RedisError:
-        app.logger.error("Failed to check payment idempotency for %s", order_id)
+        if not order_id or user_id is None or amount is None:
+            return
+        app.logger.info("ChargePayment received order_id=%s message_id=%s", order_id, message_id)
 
-    ok, reason = _charge_payment(user_id, int(amount))
-    if ok:
+        idem_key = command.get("idempotency_key", order_id)
+        attempt_id = command.get("attempt_id", "")
+        charged_key = f"{PAYMENT_CHARGED_PREFIX}{idem_key}"
         try:
-            db.set(charged_key, str(amount))
+            if db.exists(charged_key):
+                event = {
+                    "message_id": str(uuid.uuid4()),
+                    "type": "PaymentCharged",
+                    "saga_id": saga_id,
+                    "order_id": order_id,
+                    "attempt_id": attempt_id,
+                    "success": True,
+                    "reason": "Already charged",
+                    "timestamp": time.time(),
+                }
+                if send_event(event):
+                    _mark_message_processed(message_id)
+                return
         except redis.exceptions.RedisError:
-            app.logger.error("Failed to mark payment charged for %s", order_id)
-    app.logger.info("ChargePayment result order_id=%s success=%s", order_id, ok)
-    event = {
-        "message_id": str(uuid.uuid4()),
-        "type": "PaymentCharged",
-        "order_id": order_id,
-        "success": ok,
-        "reason": reason,
-        "timestamp": time.time(),
-    }
-    send_event(event)
+            app.logger.error("Failed to check payment idempotency for %s", order_id)
+
+        # Atomic: deduct credit + set charged_key in one transaction
+        ok, reason = _charge_payment(user_id, int(amount), charged_key)
+        app.logger.info("ChargePayment result order_id=%s success=%s", order_id, ok)
+        event = {
+            "message_id": str(uuid.uuid4()),
+            "type": "PaymentCharged",
+            "saga_id": saga_id,
+            "order_id": order_id,
+            "attempt_id": attempt_id,
+            "success": ok,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if send_event(event):
+            _mark_message_processed(message_id)
+        return
+
+    # ── RollbackPayment ──────────────────────────────────────────────────
+    if command_type == "RollbackPayment":
+        if _message_processed(message_id):
+            return
+        if not order_id or user_id is None or amount is None:
+            return
+        app.logger.info("RollbackPayment received order_id=%s message_id=%s", order_id, message_id)
+
+        idem_key = command.get("idempotency_key", order_id)
+        attempt_id = command.get("attempt_id", "")
+        rolled_key = f"{PAYMENT_ROLLEDBACK_PREFIX}{idem_key}"
+        charged_key = f"{PAYMENT_CHARGED_PREFIX}{idem_key}"
+        try:
+            if db.exists(rolled_key):
+                event = {
+                    "message_id": str(uuid.uuid4()),
+                    "type": "PaymentRolledBack",
+                    "saga_id": saga_id,
+                    "order_id": order_id,
+                    "attempt_id": attempt_id,
+                    "success": True,
+                    "reason": "Already rolled back",
+                    "timestamp": time.time(),
+                }
+                if send_event(event):
+                    _mark_message_processed(message_id)
+                return
+        except redis.exceptions.RedisError:
+            app.logger.error("Failed to check rollback idempotency for %s", order_id)
+
+        # Atomic: refund credit + set rolled_key + delete charged_key in one transaction
+        ok, reason = _rollback_payment(user_id, int(amount), rolled_key, charged_key)
+        app.logger.info("RollbackPayment result order_id=%s success=%s", order_id, ok)
+        event = {
+            "message_id": str(uuid.uuid4()),
+            "type": "PaymentRolledBack",
+            "saga_id": saga_id,
+            "order_id": order_id,
+            "attempt_id": attempt_id,
+            "success": ok,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if send_event(event):
+            _mark_message_processed(message_id)
+        return
 
 
 def _command_consumer_loop() -> None:
@@ -266,11 +382,12 @@ def _command_consumer_loop() -> None:
                 key_deserializer=lambda v: v.decode("utf-8") if v else None,
                 group_id="payment-saga-commands",
                 auto_offset_reset="earliest",
-                enable_auto_commit=True,
+                enable_auto_commit=False,
             )
             for message in consumer:
                 try:
                     _handle_command(message.value)
+                    consumer.commit()
                 except Exception:
                     app.logger.exception("Failed to handle saga command")
         except NoBrokersAvailable:
@@ -288,8 +405,10 @@ def _start_command_consumer() -> None:
     thread.start()
 
 
+_start_command_consumer()
+
+
 if __name__ == '__main__':
-    _start_command_consumer()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
