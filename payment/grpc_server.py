@@ -16,50 +16,53 @@ DB_ERROR_STR = "DB error"
 class PaymentServicer(services_pb2_grpc.PaymentServiceServicer):
     # gRPC Protobuff version of the HTTP Request
     def Pay(self, request, context):
-        try:
-            entry = flask_app.db.get(request.user_id)
-        except redis.exceptions.RedisError:
-            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
-
-        if entry is None:
-            context.abort(grpc.StatusCode.NOT_FOUND, f"User: {request.user_id} not found!")
-
-        user = msgpack.decode(entry, type=flask_app.UserValue)
-        user.credit -= request.amount
-
-        if user.credit < 0:
-            return services_pb2.PayReply(
-                success=False,
-                message=f"User: {request.user_id} credit cannot get reduced below zero!"
-            )
-        
-        # Return success!
-        try:
-            flask_app.db.set(request.user_id, msgpack.encode(user))
-        except redis.exceptions.RedisError:
-            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
-
-        return services_pb2.PayReply(success=True, message="OK")
+        for _attempt in range(5):
+            try:
+                with flask_app.db.pipeline() as pipe:
+                    pipe.watch(request.user_id)
+                    raw = pipe.get(request.user_id)
+                    if raw is None:
+                        pipe.unwatch()
+                        context.abort(grpc.StatusCode.NOT_FOUND, f"User: {request.user_id} not found!")
+                    user = msgpack.decode(raw, type=flask_app.UserValue)
+                    user.credit -= request.amount
+                    if user.credit < 0:
+                        pipe.unwatch()
+                        return services_pb2.PayReply(
+                            success=False,
+                            message=f"User: {request.user_id} credit cannot get reduced below zero!"
+                        )
+                    pipe.multi()
+                    pipe.set(request.user_id, msgpack.encode(user))
+                    pipe.execute()
+                    return services_pb2.PayReply(success=True, message="OK")
+            except redis.exceptions.WatchError:
+                continue
+            except redis.exceptions.RedisError:
+                context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
+        context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
 
     # gRPC Protobuff version of the HTTP Request - Refund
     def Refund(self, request, context):
-        try:
-            entry = flask_app.db.get(request.user_id)
-        except redis.exceptions.RedisError:
-            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
-
-        if entry is None:
-            context.abort(grpc.StatusCode.NOT_FOUND, f"User: {request.user_id} not found!")
-
-        user = msgpack.decode(entry, type=flask_app.UserValue)
-        user.credit += request.amount
-
-        try:
-            flask_app.db.set(request.user_id, msgpack.encode(user))
-        except redis.exceptions.RedisError:
-            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
-
-        return services_pb2.PayReply(success=True, message="OK")
+        for _attempt in range(5):
+            try:
+                with flask_app.db.pipeline() as pipe:
+                    pipe.watch(request.user_id)
+                    raw = pipe.get(request.user_id)
+                    if raw is None:
+                        pipe.unwatch()
+                        context.abort(grpc.StatusCode.NOT_FOUND, f"User: {request.user_id} not found!")
+                    user = msgpack.decode(raw, type=flask_app.UserValue)
+                    user.credit += request.amount
+                    pipe.multi()
+                    pipe.set(request.user_id, msgpack.encode(user))
+                    pipe.execute()
+                    return services_pb2.PayReply(success=True, message="OK")
+            except redis.exceptions.WatchError:
+                continue
+            except redis.exceptions.RedisError:
+                context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
+        context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
 
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))

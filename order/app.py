@@ -50,6 +50,8 @@ SAGA_LOG_PREFIX = "saga:log:"
 SAGA_STATE_PREFIX = "saga:state:"
 SAGA_LOCK_PREFIX = "saga:lock:"
 SAGA_LOCK_TTL = max(int(SAGA_TIMEOUT_SECONDS) * 5, 60)
+SAGA_COMPLETED_TTL = int(os.environ.get("SAGA_COMPLETED_TTL", "3600"))
+SAGA_NOTIFY_TTL = 60
 
 app = Flask("order-service")
 
@@ -230,6 +232,25 @@ def set_saga_state(saga_id: str, state: dict) -> bool:
         return False
 
 
+def _notify_saga_done(saga_id: str, result: str) -> None:
+    """Push notification for the waiting checkout request (cross-process via Redis)."""
+    notify_key = f"saga:notify:{saga_id}"
+    try:
+        db.rpush(notify_key, result)
+        db.expire(notify_key, SAGA_NOTIFY_TTL)
+    except redis.exceptions.RedisError:
+        app.logger.warning("Failed to notify saga completion for %s", saga_id)
+
+
+def _expire_saga_keys(saga_id: str) -> None:
+    """Set TTL on saga state and log keys after reaching terminal state."""
+    try:
+        db.expire(_saga_state_key(saga_id), SAGA_COMPLETED_TTL)
+        db.expire(_saga_log_key(saga_id), SAGA_COMPLETED_TTL)
+    except redis.exceptions.RedisError:
+        pass
+
+
 # ─── Kafka Producer ──────────────────────────────────────────────────────────
 
 _producer: KafkaProducer | None = None
@@ -320,6 +341,15 @@ def find_order(order_id: str):
             "total_cost": order_entry.total_cost,
         }
     )
+
+
+@app.get('/health')
+def health():
+    try:
+        db.ping()
+    except redis.exceptions.RedisError:
+        return Response("Redis unavailable", status=503)
+    return Response("OK", status=200)
 
 
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
@@ -569,21 +599,40 @@ def _start_saga(order_id: str) -> tuple[bool, str]:
 
 def _wait_for_saga(saga_id: str) -> tuple[bool, str]:
     """Block until the saga reaches a terminal state or times out."""
-    deadline = time.time() + SAGA_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        state = get_saga_state(saga_id)
-        if not state:
-            time.sleep(0.1)
-            continue
+    notify_key = f"saga:notify:{saga_id}"
+
+    # Quick check if already completed before blocking
+    state = get_saga_state(saga_id)
+    if state:
         status = state.get("status")
         if status == "completed":
             return True, ""
         if status == "failed":
             return False, state.get("reason", "Saga failed")
-        order_id = state.get("order_id")
-        if order_id:
-            _refresh_saga_lock(order_id, state.get("lock_token"))
-        time.sleep(0.1)
+
+    # Efficient block-wait via Redis BLPOP (no busy-polling)
+    try:
+        result = db.blpop(notify_key, timeout=int(SAGA_TIMEOUT_SECONDS))
+    except redis.exceptions.RedisError:
+        result = None
+
+    if result is not None:
+        _, value = result
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if value == "completed":
+            return True, ""
+        if value.startswith("failed:"):
+            return False, value[7:]
+        return False, value
+
+    # Timeout — final state check (in case notification was missed)
+    state = get_saga_state(saga_id)
+    if state:
+        if state.get("status") == "completed":
+            return True, ""
+        if state.get("status") == "failed":
+            return False, state.get("reason", "Saga failed")
     return False, "Checkout timed out"
 
 
@@ -649,6 +698,8 @@ def _handle_event(event: dict) -> None:
             state["last_updated"] = time.time()
             set_saga_state(saga_id, state)
             _release_saga_lock(state["order_id"], state.get("lock_token"))
+            _notify_saga_done(saga_id, f"failed:{state['reason']}")
+            _expire_saga_keys(saga_id)
             return
 
         # Stock reserved → proceed to payment
@@ -802,6 +853,8 @@ def _handle_event(event: dict) -> None:
         state["last_updated"] = time.time()
         set_saga_state(saga_id, state)
         _release_saga_lock(state["order_id"], state.get("lock_token"))
+        _notify_saga_done(saga_id, "completed")
+        _expire_saga_keys(saga_id)
         return
 
     # ── PaymentRolledBack (from payment out-queue) ───────────────────────
@@ -896,6 +949,8 @@ def _handle_event(event: dict) -> None:
         state["last_updated"] = time.time()
         set_saga_state(saga_id, state)
         _release_saga_lock(state["order_id"], state.get("lock_token"))
+        _notify_saga_done(saga_id, f"failed:{state.get('reason', 'Compensated and failed')}")
+        _expire_saga_keys(saga_id)
         return
 
 
@@ -951,6 +1006,7 @@ def _recover_saga(saga_id: str, state: dict) -> None:
     step = state.get("step")
     order_id = state.get("order_id")
     attempt_id = state.get("attempt_id", "")
+    original_last_updated = state.get("last_updated", 0)
     app.logger.info("Recovering saga %s stuck at step=%s", saga_id, step)
 
     if order_id:
@@ -1006,9 +1062,29 @@ def _recover_saga(saga_id: str, state: dict) -> None:
         }
         _send_with_retry(STOCK_COMMAND_TOPIC, command)
 
-    # Update last_updated so we don't immediately retry again
-    state["last_updated"] = time.time()
-    set_saga_state(saga_id, state)
+    # Atomically update last_updated only if state hasn't been modified concurrently
+    state_key = _saga_state_key(saga_id)
+    for _cas_attempt in range(3):
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(state_key)
+                raw = pipe.get(state_key)
+                current = _decode_json_value(raw) if raw else None
+                if not current or current.get("status") in ("completed", "failed"):
+                    pipe.unwatch()
+                    return
+                if current.get("last_updated", 0) != original_last_updated:
+                    pipe.unwatch()
+                    return  # State was updated concurrently, skip
+                current["last_updated"] = time.time()
+                pipe.multi()
+                pipe.set(state_key, json.dumps(current))
+                pipe.execute()
+                return
+        except redis.exceptions.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return
 
 
 def _saga_recovery_loop() -> None:

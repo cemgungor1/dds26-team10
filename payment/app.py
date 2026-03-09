@@ -29,9 +29,10 @@ DB_ERROR_STR = "DB error"
 KAFKA_BROKERS = os.environ.get("KAFKA_BROKERS", "kafka:9092")
 KAFKA_COMMAND_TOPIC = os.environ.get("KAFKA_COMMAND_TOPIC", "payment-commands")
 KAFKA_EVENT_TOPIC = os.environ.get("KAFKA_EVENT_TOPIC", "payment-events")
-PROCESSED_MESSAGES_SET = "payment:processed_messages"
+PROCESSED_MSG_PREFIX = "payment:processed:"
 PAYMENT_CHARGED_PREFIX = "payment:charged:"
 PAYMENT_ROLLEDBACK_PREFIX = "payment:rolledback:"
+IDEMPOTENCY_TTL = int(os.environ.get("IDEMPOTENCY_TTL", "3600"))
 
 
 app = Flask("payment-service")
@@ -82,14 +83,14 @@ def _get_user_entry(user_id: str) -> UserValue | None:
 
 def _message_processed(message_id: str) -> bool:
     try:
-        return db.sismember(PROCESSED_MESSAGES_SET, message_id)
+        return db.exists(f"{PROCESSED_MSG_PREFIX}{message_id}") > 0
     except redis.exceptions.RedisError:
         return False
 
 
 def _mark_message_processed(message_id: str) -> None:
     try:
-        db.sadd(PROCESSED_MESSAGES_SET, message_id)
+        db.set(f"{PROCESSED_MSG_PREFIX}{message_id}", "1", ex=IDEMPOTENCY_TTL)
     except redis.exceptions.RedisError:
         app.logger.error("Failed to mark message processed: %s", message_id)
 
@@ -164,6 +165,15 @@ def find_user(user_id: str):
     )
 
 
+@app.get('/health')
+def health():
+    try:
+        db.ping()
+    except redis.exceptions.RedisError:
+        return Response("Redis unavailable", status=503)
+    return Response("OK", status=200)
+
+
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
     amount = int(amount)
@@ -228,7 +238,7 @@ def _charge_payment(user_id: str, amount: int, charged_key: str) -> tuple[bool, 
                     return False, "User out of credit"
                 pipe.multi()
                 pipe.set(user_id, msgpack.encode(user_entry))
-                pipe.set(charged_key, json.dumps({"user_id": user_id, "amount": amount}))
+                pipe.set(charged_key, json.dumps({"user_id": user_id, "amount": amount}), ex=IDEMPOTENCY_TTL)
                 pipe.execute()
                 return True, ""
         except redis.exceptions.WatchError:
@@ -254,7 +264,7 @@ def _rollback_payment(user_id: str, amount: int, rolled_key: str, charged_key: s
                 user_entry.credit += amount
                 pipe.multi()
                 pipe.set(user_id, msgpack.encode(user_entry))
-                pipe.set(rolled_key, "1")
+                pipe.set(rolled_key, "1", ex=IDEMPOTENCY_TTL)
                 pipe.delete(charged_key)
                 pipe.execute()
                 return True, ""

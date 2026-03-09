@@ -33,49 +33,53 @@ class StockServicer(services_pb2_grpc.StockServiceServicer):
 
     # gRPC Protobuff version of the HTTP Request
     def SubtractStock(self, request, context):
-        try:
-            entry = flask_app.db.get(request.item_id)
-        except redis.exceptions.RedisError:
-            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
-
-        if entry is None:
-            context.abort(grpc.StatusCode.NOT_FOUND, f"Item: {request.item_id} not found!")
-
-        item = msgpack.decode(entry, type=flask_app.StockValue)
-        item.stock -= request.quantity
-
-        if item.stock < 0:
-            return services_pb2.StockReply(
-                success=False,
-                message=f"Item: {request.item_id} stock cannot get reduced below zero!"
-            )
-
-        try:
-            flask_app.db.set(request.item_id, msgpack.encode(item))
-        except redis.exceptions.RedisError:
-            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
-
-        return services_pb2.StockReply(success=True, message="OK")
+        for _attempt in range(5):
+            try:
+                with flask_app.db.pipeline() as pipe:
+                    pipe.watch(request.item_id)
+                    raw = pipe.get(request.item_id)
+                    if raw is None:
+                        pipe.unwatch()
+                        context.abort(grpc.StatusCode.NOT_FOUND, f"Item: {request.item_id} not found!")
+                    item = msgpack.decode(raw, type=flask_app.StockValue)
+                    item.stock -= request.quantity
+                    if item.stock < 0:
+                        pipe.unwatch()
+                        return services_pb2.StockReply(
+                            success=False,
+                            message=f"Item: {request.item_id} stock cannot get reduced below zero!"
+                        )
+                    pipe.multi()
+                    pipe.set(request.item_id, msgpack.encode(item))
+                    pipe.execute()
+                    return services_pb2.StockReply(success=True, message="OK")
+            except redis.exceptions.WatchError:
+                continue
+            except redis.exceptions.RedisError:
+                context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
+        context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
 
     # gRPC Protobuff version of the HTTP Request
     def AddStock(self, request, context):
-        try:
-            entry = flask_app.db.get(request.item_id)
-        except redis.exceptions.RedisError:
-            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
-        
-        if entry is None:
-            context.abort(grpc.StatusCode.NOT_FOUND, f"Item: {request.item_id} not found!")
-
-        item = msgpack.decode(entry, type=flask_app.StockValue)
-        item.stock += request.quantity
-
-        try:
-            flask_app.db.set(request.item_id, msgpack.encode(item))
-        except redis.exceptions.RedisError:
-            context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
-
-        return services_pb2.StockReply(success=True, message="OK")
+        for _attempt in range(5):
+            try:
+                with flask_app.db.pipeline() as pipe:
+                    pipe.watch(request.item_id)
+                    raw = pipe.get(request.item_id)
+                    if raw is None:
+                        pipe.unwatch()
+                        context.abort(grpc.StatusCode.NOT_FOUND, f"Item: {request.item_id} not found!")
+                    item = msgpack.decode(raw, type=flask_app.StockValue)
+                    item.stock += request.quantity
+                    pipe.multi()
+                    pipe.set(request.item_id, msgpack.encode(item))
+                    pipe.execute()
+                    return services_pb2.StockReply(success=True, message="OK")
+            except redis.exceptions.WatchError:
+                continue
+            except redis.exceptions.RedisError:
+                context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
+        context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
 
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))

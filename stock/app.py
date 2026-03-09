@@ -30,9 +30,10 @@ DB_ERROR_STR = "DB error"
 KAFKA_BROKERS = os.environ.get("KAFKA_BROKERS", "kafka:9092")
 KAFKA_COMMAND_TOPIC = os.environ.get("KAFKA_COMMAND_TOPIC", "stock-commands")
 KAFKA_EVENT_TOPIC = os.environ.get("KAFKA_EVENT_TOPIC", "stock-events")
-PROCESSED_MESSAGES_SET = "stock:processed_messages"
+PROCESSED_MSG_PREFIX = "stock:processed:"
 STOCK_RESERVED_PREFIX = "stock:reserved:"
 STOCK_ROLLEDBACK_PREFIX = "stock:rolledback:"
+IDEMPOTENCY_TTL = int(os.environ.get("IDEMPOTENCY_TTL", "3600"))
 
 app = Flask("stock-service")
 
@@ -83,14 +84,14 @@ def _get_item_entry(item_id: str) -> StockValue | None:
 
 def _message_processed(message_id: str) -> bool:
     try:
-        return db.sismember(PROCESSED_MESSAGES_SET, message_id)
+        return db.exists(f"{PROCESSED_MSG_PREFIX}{message_id}") > 0
     except redis.exceptions.RedisError:
         return False
 
 
 def _mark_message_processed(message_id: str) -> None:
     try:
-        db.sadd(PROCESSED_MESSAGES_SET, message_id)
+        db.set(f"{PROCESSED_MSG_PREFIX}{message_id}", "1", ex=IDEMPOTENCY_TTL)
     except redis.exceptions.RedisError:
         app.logger.error("Failed to mark message processed: %s", message_id)
 
@@ -165,6 +166,15 @@ def find_item(item_id: str):
             "price": item_entry.price
         }
     )
+
+
+@app.get('/health')
+def health():
+    try:
+        db.ping()
+    except redis.exceptions.RedisError:
+        return Response("Redis unavailable", status=503)
+    return Response("OK", status=200)
 
 
 @app.post('/add/<item_id>/<amount>')
@@ -243,7 +253,7 @@ def _reserve_stock(items: list[dict], reserved_key: str = None) -> tuple[bool, s
                     entry.stock -= quantity
                     pipe.set(item_id, msgpack.encode(entry))
                 if reserved_key:
-                    pipe.set(reserved_key, json.dumps(items))
+                    pipe.set(reserved_key, json.dumps(items), ex=IDEMPOTENCY_TTL)
                 pipe.execute()
                 return True, ""
         except redis.exceptions.WatchError:
@@ -278,7 +288,7 @@ def _rollback_stock(items: list[dict], rolled_key: str = None, reserved_key_to_d
                     entry.stock += quantity
                     pipe.set(item_id, msgpack.encode(entry))
                 if rolled_key:
-                    pipe.set(rolled_key, "1")
+                    pipe.set(rolled_key, "1", ex=IDEMPOTENCY_TTL)
                 if reserved_key_to_delete:
                     pipe.delete(reserved_key_to_delete)
                 pipe.execute()
