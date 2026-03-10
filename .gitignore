@@ -1,8 +1,16 @@
 .idea
 .DS_Store
 
+<<<<<<< feat/redis-sentinel
 order/__pycache__
 stock/__pycache__
 payment/__pycache__
 test/__pycache__
 redis/*
+=======
+benchmarks/BCT/__pycache__/*
+benchmarks/BSCT/consistency-test/__pycache__/*
+benchmarks/BSCT/stress-test/__pycache__/*
+test/__pycache__/*
+order/__pycache__/*
+>>>>>>> main
