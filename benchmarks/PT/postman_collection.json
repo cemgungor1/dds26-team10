@@ -1,0 +1,613 @@
+{
+  "info": {
+    "name": "Microservices Test Suite",
+    "description": "Comprehensive Postman tests for order, stock, and payment microservices",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "BASE_URL", "value": "http://127.0.0.1:8000" },
+    { "key": "item_id_1", "value": "" },
+    { "key": "item_id_2", "value": "" },
+    { "key": "user_id",   "value": "" },
+    { "key": "order_id",  "value": "" }
+  ],
+  "item": [
+
+    {
+      "name": "Stock Service",
+      "item": [
+        {
+          "name": "Create Item",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has item_id', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json).to.have.property('item_id');",
+                  "  pm.collectionVariables.set('item_id_1', json.item_id);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/stock/item/create/10"
+          }
+        },
+        {
+          "name": "Create Second Item",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has item_id', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json).to.have.property('item_id');",
+                  "  pm.collectionVariables.set('item_id_2', json.item_id);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/stock/item/create/20"
+          }
+        },
+        {
+          "name": "Find Item",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Correct price', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.price).to.eql(10);",
+                  "  pm.expect(json.stock).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/stock/find/{{item_id_1}}"
+          }
+        },
+        {
+          "name": "Find Item - Not Found",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 400 for missing item', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/stock/find/nonexistent-item-id"
+          }
+        },
+        {
+          "name": "Add Stock",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/stock/add/{{item_id_1}}/50"
+          }
+        },
+        {
+          "name": "Verify Stock After Add",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Stock is 50', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.stock).to.eql(50);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/stock/find/{{item_id_1}}"
+          }
+        },
+        {
+          "name": "Subtract Stock",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/stock/subtract/{{item_id_1}}/20"
+          }
+        },
+        {
+          "name": "Verify Stock After Subtract",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Stock is 30', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.stock).to.eql(30);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/stock/find/{{item_id_1}}"
+          }
+        },
+        {
+          "name": "Subtract Stock - Insufficient",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 400 for over-subtraction', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/stock/subtract/{{item_id_1}}/9999"
+          }
+        },
+        {
+          "name": "Verify Stock Unchanged After Failed Subtract",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Stock still 30 after failed subtract', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.stock).to.eql(30);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/stock/find/{{item_id_1}}"
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Payment Service",
+      "item": [
+        {
+          "name": "Create User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has user_id', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json).to.have.property('user_id');",
+                  "  pm.collectionVariables.set('user_id', json.user_id);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/payment/create_user"
+          }
+        },
+        {
+          "name": "Find User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Credit starts at 0', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.credit).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/payment/find_user/{{user_id}}"
+          }
+        },
+        {
+          "name": "Find User - Not Found",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 400 for missing user', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/payment/find_user/nonexistent-user-id"
+          }
+        },
+        {
+          "name": "Add Funds",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/payment/add_funds/{{user_id}}/100"
+          }
+        },
+        {
+          "name": "Verify Credit After Add",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Credit is 100', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.credit).to.eql(100);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/payment/find_user/{{user_id}}"
+          }
+        },
+        {
+          "name": "Pay",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/payment/pay/{{user_id}}/40"
+          }
+        },
+        {
+          "name": "Verify Credit After Pay",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Credit is 60', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.credit).to.eql(60);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/payment/find_user/{{user_id}}"
+          }
+        },
+        {
+          "name": "Pay - Insufficient Credit",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 400 for insufficient credit', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/payment/pay/{{user_id}}/9999"
+          }
+        },
+        {
+          "name": "Verify Credit Unchanged After Failed Pay",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Credit still 60 after failed pay', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.credit).to.eql(60);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/payment/find_user/{{user_id}}"
+          }
+        }
+      ]
+    },
+
+    {
+      "name": "Order Service",
+      "item": [
+        {
+          "name": "Create Order",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has order_id', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json).to.have.property('order_id');",
+                  "  pm.collectionVariables.set('order_id', json.order_id);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/orders/create/{{user_id}}"
+          }
+        },
+        {
+          "name": "Find Order",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Order not paid, empty items', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.paid).to.eql(false);",
+                  "  pm.expect(json.items).to.eql([]);",
+                  "  pm.expect(json.total_cost).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/orders/find/{{order_id}}"
+          }
+        },
+        {
+          "name": "Add Item to Order",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/orders/addItem/{{order_id}}/{{item_id_1}}/2"
+          }
+        },
+        {
+          "name": "Verify Order After Adding Item",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Total cost updated', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.total_cost).to.eql(20);",
+                  "  pm.expect(json.items.length).to.eql(1);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/orders/find/{{order_id}}"
+          }
+        },
+        {
+          "name": "Checkout - Insufficient Credit",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 400 - no credit', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/orders/checkout/{{order_id}}"
+          }
+        },
+        {
+          "name": "Verify Stock Rolled Back After Failed Checkout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Stock rolled back to 30', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.stock).to.eql(30);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/stock/find/{{item_id_1}}"
+          }
+        },
+        {
+          "name": "Add Funds For Checkout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/payment/add_funds/{{user_id}}/100"
+          }
+        },
+        {
+          "name": "Checkout - Success",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200 - checkout success', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{BASE_URL}}/orders/checkout/{{order_id}}"
+          }
+        },
+        {
+          "name": "Verify Order Paid",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Order is paid', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.paid).to.eql(true);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/orders/find/{{order_id}}"
+          }
+        },
+        {
+          "name": "Verify Stock Deducted After Checkout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Stock reduced by 2 to 28', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.stock).to.eql(28);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/stock/find/{{item_id_1}}"
+          }
+        },
+        {
+          "name": "Verify Credit Deducted After Checkout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Credit reduced by 20', () => {",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.credit).to.eql(140);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{BASE_URL}}/payment/find_user/{{user_id}}"
+          }
+        }
+      ]
+    }
+  ]
+}
