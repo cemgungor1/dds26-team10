@@ -77,6 +77,7 @@ class OrderValue(Struct):
 
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
+    '''Retrieve an order from the database by its ID. This is used in request contexts where we can abort on failure.'''
     try:
         entry: bytes = db.get(order_id)
     except redis.exceptions.RedisError:
@@ -147,6 +148,7 @@ def _encode_saga_log_entry(saga_id: str, entry: dict) -> str:
 
 
 def _refresh_saga_lock(order_id: str, lock_token: str | None) -> None:
+    '''Refresh the saga lock TTL if the token matches (to prevent premature expiration during long processing).'''
     if not lock_token:
         return
     lock_key = _saga_lock_key(order_id)
@@ -170,6 +172,7 @@ def _refresh_saga_lock(order_id: str, lock_token: str | None) -> None:
 
 
 def _release_saga_lock(order_id: str, lock_token: str | None) -> None:
+    '''Release the saga lock if the token matches (to allow new checkouts after completion).'''
     if not lock_token:
         return
     lock_key = _saga_lock_key(order_id)
@@ -216,6 +219,7 @@ def get_saga_log(saga_id: str) -> list[dict]:
 
 
 def get_saga_state(saga_id: str) -> dict | None:
+    '''Retrieve the current state of a saga. Returns None if not found or on error.'''
     try:
         raw = db.get(_saga_state_key(saga_id))
     except redis.exceptions.RedisError:
@@ -224,6 +228,7 @@ def get_saga_state(saga_id: str) -> dict | None:
 
 
 def set_saga_state(saga_id: str, state: dict) -> bool:
+    """Persist the current state of a saga. Returns True on success."""
     try:
         db.set(_saga_state_key(saga_id), json.dumps(state))
         return True
@@ -345,6 +350,7 @@ def find_order(order_id: str):
 
 @app.get('/health')
 def health():
+    '''Health check endpoint to verify Redis connectivity.'''
     try:
         db.ping()
     except redis.exceptions.RedisError:
