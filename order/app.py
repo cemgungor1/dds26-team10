@@ -21,37 +21,55 @@ GATEWAY_URL = os.environ['GATEWAY_URL']
 
 app = Flask("order-service")
 
-def make_redis_client() -> redis.Redis:
-    # REDIS_SENTINELS="host1:26379,host2:26379"
-    sentinels_raw = os.environ["REDIS_SENTINELS"]
-    sentinel_addrs = []
-    for part in sentinels_raw.split(","):
-        host, port = part.strip().split(":")
-        sentinel_addrs.append((host, int(port)))
 
-    master_name = os.environ["REDIS_MASTER_NAME"]
-    password = os.environ.get("REDIS_PASSWORD")  # password for Redis master/replicas
-    db_index = int(os.environ.get("REDIS_DB", "0"))
+def _make_redis_client(
+    host_var: str = "REDIS_HOST",
+    port_var: str = "REDIS_PORT",
+    password_var: str = "REDIS_PASSWORD",
+    db_var: str = "REDIS_DB",
+    sentinels_var: str = "REDIS_SENTINELS",
+    sentinel_master_var: str = "REDIS_MASTER_NAME",
+) -> redis.Redis:
+    sentinels_raw = os.environ.get(sentinels_var)
+    if sentinels_raw:
+        sentinel_addrs: list[tuple[str, int]] = []
+        for part in sentinels_raw.split(","):
+            host, port = part.strip().split(":")
+            sentinel_addrs.append((host, int(port)))
 
-    # sentinel_kwargs: auth to talk to Sentinel itself (only needed if you set requirepass for sentinel)
-    # If your sentinel does NOT require auth, leave it empty.
-    sentinel = Sentinel(
-        sentinel_addrs,
-        socket_timeout=1.0,
-        sentinel_kwargs={},  # e.g. {"password": os.environ["SENTINEL_PASSWORD"]}
-    )
+        master_name = os.environ[sentinel_master_var]
+        password = os.environ.get(password_var)
+        db_index = int(os.environ.get(db_var, "0"))
 
-    # This returns a Redis client that always targets the CURRENT master.
-    return sentinel.master_for(
-        service_name=master_name,
+        sentinel = Sentinel(
+            sentinel_addrs,
+            socket_timeout=1.0,
+            sentinel_kwargs={},
+        )
+        return sentinel.master_for(
+            service_name=master_name,
+            password=password,
+            db=db_index,
+            socket_timeout=1.0,
+            retry_on_timeout=True,
+            decode_responses=False,
+        )
+
+    host = os.environ[host_var]
+    port = int(os.environ.get(port_var, "6379"))
+    password = os.environ.get(password_var)
+    db_index = int(os.environ.get(db_var, "0"))
+    return redis.Redis(
+        host=host,
+        port=port,
         password=password,
         db=db_index,
         socket_timeout=1.0,
         retry_on_timeout=True,
-        decode_responses=False,  # keep bytes because you msgpack encode/decode
     )
 
-db: redis.Redis = make_redis_client()
+
+db: redis.Redis = _make_redis_client()
 
 def close_db_connection():
     db.close()
