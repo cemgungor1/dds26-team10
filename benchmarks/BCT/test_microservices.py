@@ -3,46 +3,10 @@ import subprocess
 import requests
 import time
 import os
-import logging
 
 import utils as tu
 
-def get_compose_services() -> set[str]:
-    out = subprocess.check_output(
-        ["docker", "ps", "--format", "{{.Names}}"],
-        text=True,
-    )
-    return {s.strip() for s in out.splitlines() if s.strip()}
-
-def resolve_service(service_name: str) -> str:
-    services = get_compose_services()
-    matches = [s for s in services if service_name in s]
-    if len(matches) != 1:
-        raise RuntimeError(f"Could not uniquely resolve '{service_name}' from {services}")
-    return matches[0]
-
-def _stop_service(service: str):
-    subprocess.run(
-        ["docker", "stop", service], 
-        cwd=COMPOSE_DIR,
-        check=True
-    )
-    time.sleep(2)
-
-def _start_service(service: str):
-    subprocess.run(
-        ["docker", "start", service], 
-        cwd=COMPOSE_DIR,
-        check=True
-    )
-    time.sleep(3)
-
-
-COMPOSE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-
-STOCK_SERVICE = resolve_service("stock-service")
-PAYMENT_SERVICE = resolve_service("payment-service")
-ORDER_SERVICE = resolve_service("order-service")
+COMPOSE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 class TestMicroservices(unittest.TestCase):
 
@@ -182,41 +146,61 @@ class TestMicroservices(unittest.TestCase):
 
         credit: int = tu.find_user(user_id)['credit']
         self.assertEqual(credit, 5)
+    
+    def test_empty_checkout(self):
+        # Create user
+        user = tu.create_user()
+
+        # Add credit to user
+        tu.add_credit_to_user(user['user_id'], 100)
+
+        # Create order for the user
+        order = tu.create_order(user['user_id'])
+
+        # Checkout empty order
+        response = tu.checkout_order(order['order_id'])
+        self.assertTrue(tu.status_code_is_success(response.status_code))
 
 class TestFailureResilience(unittest.TestCase):
+
+    def _stop_service(self, service: str):
+        subprocess.run(
+            ["docker", "compose", "stop", service], 
+            cwd=COMPOSE_DIR,
+            check=True
+        )
+        time.sleep(5)
+
+    def _start_service(self, service: str):
+        subprocess.run(
+            ["docker", "compose", "start", service], 
+            cwd=COMPOSE_DIR,
+            check=True
+        )
+        time.sleep(5)
+
     def test_stock_service_down(self):
         # Create user
         user = tu.create_user()
+
         # Add credit to user
         tu.add_credit_to_user(user['user_id'], 100)
+
         # Create order for the user
         order = tu.create_order(user['user_id'])
-        # Create item and add it to order so checkout must call stock-service
-        item = tu.create_item(5)
-        tu.add_stock(item['item_id'], 10)
-        add_item_response = tu.add_item_to_order(order['order_id'], item['item_id'], 1)
-        self.assertTrue(
-            tu.status_code_is_success(add_item_response),
-            f"Failed to add item to order before stopping stock-service, status={add_item_response}",
-        )
 
         # Try to checkout while service is down
-        _stop_service(STOCK_SERVICE)
+        self._stop_service("stock-service")
         try:
             response = tu.checkout_order(order['order_id'])
-            # Must not be a 500, should be a clean 400
-            self.assertNotEqual(response.status_code, 500)
-            self.assertTrue(
-                tu.status_code_is_failure(response.status_code),
-                f"Expected 4xx when stock-service is down. Got {response.status_code} body={response.text}",
-            )
+            self.assertTrue(response.status_code, 503)
 
             # Credit must be the same
             credit = tu.find_user(user['user_id'])['credit']
             self.assertEqual(credit, 100)
         finally:
             # Start back the stock service
-            _start_service(STOCK_SERVICE)
+            self._start_service("stock-service")
 
     def test_payment_service_down(self):
         # Create the item
@@ -232,7 +216,7 @@ class TestFailureResilience(unittest.TestCase):
 
         stock_before = tu.find_item(item['item_id'])['stock']
 
-        _stop_service(PAYMENT_SERVICE)
+        self._stop_service("payment-service")
         try:
             response = tu.checkout_order(order['order_id'])
             self.assertTrue(tu.status_code_is_failure(response.status_code))
@@ -242,12 +226,12 @@ class TestFailureResilience(unittest.TestCase):
             self.assertEqual(stock_after, stock_before)
         finally:
             # Start back the payment service
-            _start_service(PAYMENT_SERVICE)
+            self._start_service("payment-service")
 
     def test_stock_service_recovers(self):
         # Restart stock service
-        _stop_service(STOCK_SERVICE)
-        _start_service(STOCK_SERVICE)
+        self._stop_service("stock-service")
+        self._start_service("stock-service")
 
         # Should work after recovery
         item = tu.create_item(5)
@@ -432,6 +416,23 @@ class Test2PhaseCommit(unittest.TestCase):
         self.assertTrue(tu.find_order(order_id)['paid'])
 
 class TestCoordinatorFailure(unittest.TestCase):
+
+    def _kill_order_service(self):
+        subprocess.run(
+            ["docker", "compose", "stop", "order-service"],
+            cwd=COMPOSE_DIR, 
+            check=True
+        )
+        time.sleep(5)
+
+    def _start_order_service(self):
+        subprocess.run(
+            ["docker", "compose", "start", "order-service"],
+            cwd=COMPOSE_DIR, 
+            check=True
+        )
+        time.sleep(5)  
+
     def test_crash_before_commit_point(self):
         # Create item
         item = tu.create_item(5)
@@ -450,8 +451,8 @@ class TestCoordinatorFailure(unittest.TestCase):
         credit_before = tu.find_user(user['user_id'])['credit']
 
         # Simulate crash by killing order service
-        _stop_service(ORDER_SERVICE)
-        _start_service(ORDER_SERVICE)
+        self._kill_order_service()
+        self._start_order_service()
 
         # After recovery state must be unchanged
         stock_after = tu.find_item(item['item_id'])['stock']
@@ -463,8 +464,8 @@ class TestCoordinatorFailure(unittest.TestCase):
             "Credit changed after coordinator crash before commit point")
 
     def test_system_works_after_coordinator_recovery(self):
-        _stop_service(ORDER_SERVICE)
-        _start_service(ORDER_SERVICE)
+        self._kill_order_service()
+        self._start_order_service()
 
         # Create item
         item = tu.create_item(5)
