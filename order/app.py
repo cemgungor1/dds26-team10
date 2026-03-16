@@ -9,9 +9,13 @@ import uuid
 from collections import defaultdict
 
 import redis
+from redis.exceptions import RedisError
+import requests
+#import requests deprecated, instead use grpc
 import grpc
 import services_pb2
 from grpc_clients import stock_stub, payment_stub
+from redis_ha import make_redis_client as _make_redis_client
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -55,12 +59,8 @@ SAGA_NOTIFY_TTL = 60
 
 app = Flask("order-service")
 
-db: redis.Redis = redis.Redis(
-    host=os.environ['REDIS_HOST'],
-    port=int(os.environ['REDIS_PORT']),
-    password=os.environ['REDIS_PASSWORD'],
-    db=int(os.environ['REDIS_DB']))
 
+db = _make_redis_client()
 
 def close_db_connection():
     db.close()
@@ -302,7 +302,7 @@ def create_order(user_id: str):
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         db.set(key, value)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
@@ -329,7 +329,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     kv_pairs = {f"{i}": msgpack.encode(generate_entry()) for i in range(n)}
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 

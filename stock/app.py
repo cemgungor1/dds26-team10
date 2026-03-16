@@ -7,6 +7,9 @@ import time
 import uuid
 
 import redis
+from redis.exceptions import RedisError
+from redis_ha import make_redis_client as _make_redis_client
+
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -37,10 +40,9 @@ IDEMPOTENCY_TTL = int(os.environ.get("IDEMPOTENCY_TTL", "3600"))
 
 app = Flask("stock-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+
+db = _make_redis_client()
+
 
 
 def close_db_connection():
@@ -55,11 +57,11 @@ class StockValue(Struct):
     price: int
 
 
-def get_item_from_db(item_id: str) -> StockValue | None:
+def get_item_from_db(item_id: str) -> StockValue:
     # get serialized data
     try:
-        entry: bytes = db.get(item_id)
-    except redis.exceptions.RedisError:
+        entry: bytes | None = db.get(item_id)
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
     entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
@@ -138,7 +140,7 @@ def create_item(price: int):
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
         db.set(key, value)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
 
@@ -152,7 +154,7 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
 

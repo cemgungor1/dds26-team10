@@ -38,21 +38,3 @@ message StockReply
   bool   success = 1;
   string message = 2;
 }
-
-service PaymentService 
-{ // Remote Procedure Calls for PaymentService
-  rpc Pay (PayRequest) returns (PayReply);
-  rpc Refund (PayRequest) returns (PayReply);
-}
-
-message PayRequest 
-{ // Request a payment amount for a user
-  string user_id = 1;
-  int32  amount  = 2;
-}
-
-message PayReply 
-{ // Reply back for changes in payment
-  bool   success = 1;
-  string message = 2;
-}

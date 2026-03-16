@@ -7,6 +7,8 @@ import time
 import uuid
 
 import redis
+from redis.exceptions import RedisError
+from redis_ha import make_redis_client as _make_redis_client
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -34,13 +36,10 @@ PAYMENT_CHARGED_PREFIX = "payment:charged:"
 PAYMENT_ROLLEDBACK_PREFIX = "payment:rolledback:"
 IDEMPOTENCY_TTL = int(os.environ.get("IDEMPOTENCY_TTL", "3600"))
 
-
 app = Flask("payment-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+
+db = _make_redis_client()
 
 
 def close_db_connection():
@@ -57,8 +56,8 @@ class UserValue(Struct):
 def get_user_from_db(user_id: str) -> UserValue | None:
     try:
         # get serialized data
-        entry: bytes = db.get(user_id)
-    except redis.exceptions.RedisError:
+        entry: bytes | None = db.get(user_id)
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
     entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
@@ -136,7 +135,7 @@ def create_user():
     value = msgpack.encode(UserValue(credit=0))
     try:
         db.set(key, value)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
 
@@ -149,7 +148,7 @@ def batch_init_users(n: int, starting_money: int):
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"})
 

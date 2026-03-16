@@ -1,6 +1,23 @@
 version: "3"
-services:
 
+x-redis-replica: &redis-replica
+  image: redis:7.2-bookworm
+  restart: unless-stopped
+  command:
+    - sh
+    - -lc
+    - |
+      exec redis-server /usr/local/etc/redis/redis.conf \
+        --replicaof "$$MASTER_HOST" "$$MASTER_PORT" \
+        --masterauth "$$REDIS_PASSWORD" \
+        --requirepass "$$REDIS_PASSWORD"
+  environment:
+    REDIS_PASSWORD: redis
+    MASTER_PORT: "6379"   # default, can override per service
+  volumes:
+    - ./master/redis.conf:/usr/local/etc/redis/redis.conf:ro
+
+services:
   gateway:
     image: nginx:1.25-bookworm
     restart: always
@@ -12,6 +29,28 @@ services:
       - order-service
       - stock-service
       - payment-service
+
+  zookeeper:
+      image: confluentinc/cp-zookeeper:7.6.1
+      restart: always
+      environment:
+        ZOOKEEPER_CLIENT_PORT: 2181
+        ZOOKEEPER_TICK_TIME: 2000
+  kafka:
+      image: confluentinc/cp-kafka:7.6.1
+      ports:
+        - "9092:9092"
+      restart: always
+      depends_on:
+        - zookeeper   
+      environment:
+        KAFKA_BROKER_ID: 1
+        KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+        KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+        KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+        KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+        KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+        KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
   order-service:
     build: ./order
@@ -30,15 +69,65 @@ services:
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
       - kafka
+      - redis-master-order
+      - redis-sentinel-order
 
-  order-db:
+  redis-master-order:
     image: redis:7.2-bookworm
-    restart: always
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    container_name: redis-master-order
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
     volumes:
-      - order-db-data:/data
+      - redis-order-data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+
+  redis-replica1-order:
+    <<: *redis-replica
+    container_name: redis-replica1-order
+    depends_on: [redis-master-order]
+    environment:
+      MASTER_HOST: redis-master-order
+      REDIS_PASSWORD: redis
+      MASTER_PORT: "6379"
+    volumes:
+      - redis-order-replica1-data:/data
+      - ./config/redis-replica.conf:/usr/local/etc/redis/redis.conf:ro
+
+  redis-replica2-order:
+    <<: *redis-replica
+    container_name: redis-replica2-order
+    depends_on: [redis-master-order]
+    environment:
+      MASTER_HOST: redis-master-order
+      REDIS_PASSWORD: redis
+      MASTER_PORT: "6379"
+      #MASTER_PORT: "6379"
+    volumes:
+      - redis-order-replica2-data:/data
+      - ./config/redis-replica.conf:/usr/local/etc/redis/redis.conf:ro
+
+  redis-sentinel-order:
+    image: redis:7.2-bookworm
+    container_name: redis-sentinel-order
+    restart: unless-stopped
+    depends_on:
+      - redis-master-order
+      - redis-replica1-order
+      - redis-replica2-order
+    ports:
+      - "26379:26379"
+    volumes:
+      - redis-order-sentinel:/data
+      - ./config/order-sentinel.conf:/etc/redis/sentinel-base.conf:ro
+    command:
+      - sh
+      - -lc
+      - |
+        cp /etc/redis/sentinel-base.conf /data/sentinel.conf 2>/dev/null || true
+        exec redis-sentinel /data/sentinel.conf
 
   stock-service:
     build: ./stock
@@ -52,15 +141,66 @@ services:
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
       - kafka
+      - redis-master-stock
+      - redis-sentinel-stock
 
-  stock-db:
+  redis-master-stock:
     image: redis:7.2-bookworm
-    restart: always
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    container_name: redis-master-stock
+    restart: unless-stopped
+    #ports:
+    #  - "6379:6379"
     volumes:
-      - stock-db-data:/data
+      - redis-stock-data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+
+  redis-replica1-stock:
+    <<: *redis-replica
+    container_name: redis-replica1-stock
+    depends_on: [redis-master-stock]
+    environment:
+      MASTER_HOST: redis-master-stock
+      REDIS_PASSWORD: redis
+      MASTER_PORT: "6379"
+    volumes:
+      - redis-stock-replica1-data:/data
+      - ./config/redis-replica.conf:/usr/local/etc/redis/redis.conf:ro
+
+  redis-replica2-stock:
+    <<: *redis-replica
+    container_name: redis-replica2-stock
+    depends_on: [redis-master-stock]
+    environment:
+      MASTER_HOST: redis-master-stock
+      REDIS_PASSWORD: redis
+      MASTER_PORT: "6379"
+      #MASTER_PORT: "6379"
+    volumes:
+      - redis-stock-replica2-data:/data
+      - ./config/redis-replica.conf:/usr/local/etc/redis/redis.conf:ro
+
+  redis-sentinel-stock:
+    image: redis:7.2-bookworm
+    container_name: redis-sentinel-stock
+    restart: unless-stopped
+    depends_on:
+      - redis-master-stock
+      - redis-replica1-stock
+      - redis-replica2-stock
+    ports:
+      - "26380:26379"
+    volumes:
+      - redis-stock-sentinel:/data
+      - ./config/stock-sentinel.conf:/etc/redis/sentinel-base.conf:ro
+    command:
+      - sh
+      - -lc
+      - |
+        cp /etc/redis/sentinel-base.conf /data/sentinel.conf 2>/dev/null || true
+        exec redis-sentinel /data/sentinel.conf
+
 
   payment-service:
     build: ./payment
@@ -74,40 +214,77 @@ services:
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
       - kafka
+      - redis-master-payment
+      - redis-sentinel-payment
 
-  payment-db:
+  redis-master-payment:
     image: redis:7.2-bookworm
-    restart: always
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    container_name: redis-master-payment
+    restart: unless-stopped
+    #ports:
+    #  - "6379:6379"
     volumes:
-      - payment-db-data:/data
+      - redis-payment-data:/data
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
 
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.1
-    restart: always
+  redis-replica1-payment:
+    <<: *redis-replica
+    container_name: redis-replica1-payment
+    depends_on: [redis-master-payment]
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
+      MASTER_HOST: redis-master-payment
+      REDIS_PASSWORD: redis
+      MASTER_PORT: "6379"
+    volumes:
+      - redis-payment-replica1-data:/data
+      - ./config/redis-replica.conf:/usr/local/etc/redis/redis.conf:ro
 
-  kafka:
-    image: confluentinc/cp-kafka:7.6.1
-    ports:
-      - "9092:9092"
-    restart: always
+  redis-replica2-payment:
+    <<: *redis-replica
+    container_name: redis-replica2-payment
+    depends_on: [redis-master-payment]
+    environment:
+      MASTER_HOST: redis-master-payment
+      REDIS_PASSWORD: redis
+      MASTER_PORT: "6379"
+    volumes:
+      - redis-payment-replica2-data:/data
+      - ./config/redis-replica.conf:/usr/local/etc/redis/redis.conf:ro
+
+  redis-sentinel-payment:
+    image: redis:7.2-bookworm
+    container_name: redis-sentinel-payment
+    restart: unless-stopped
     depends_on:
-      - zookeeper
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      - redis-master-payment
+      - redis-replica1-payment
+      - redis-replica2-payment
+    ports:
+      - "26381:26379"
+    volumes:
+      - redis-payment-sentinel:/data
+      - ./config/payment-sentinel.conf:/etc/redis/sentinel-base.conf:ro
+    command:
+      - sh
+      - -lc
+      - |
+        cp /etc/redis/sentinel-base.conf /data/sentinel.conf 2>/dev/null || true
+        exec redis-sentinel /data/sentinel.conf
+
 
 volumes:
-  order-db-data:
-  stock-db-data:
-  payment-db-data:
+  redis-order-data:
+  redis-order-replica1-data:
+  redis-order-replica2-data:
+  redis-order-sentinel:
+  redis-stock-data:
+  redis-stock-replica1-data:
+  redis-stock-replica2-data:
+  redis-stock-sentinel:
+  redis-payment-data:
+  redis-payment-replica1-data:
+  redis-payment-replica2-data:
+  redis-payment-sentinel:
+
