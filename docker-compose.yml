@@ -45,6 +45,7 @@ services:
       - env/order_redis.env
     depends_on:
       - redis-master-order
+      - redis-sentinel-order
 
   redis-master-order:
     image: redis:7.2-bookworm
@@ -60,7 +61,6 @@ services:
   redis-replica1-order:
     <<: *redis-replica
     container_name: redis-replica1-order
-    profiles: ["sentinel"]
     depends_on: [redis-master-order]
     environment:
       MASTER_HOST: redis-master-order
@@ -73,7 +73,6 @@ services:
   redis-replica2-order:
     <<: *redis-replica
     container_name: redis-replica2-order
-    profiles: ["sentinel"]
     depends_on: [redis-master-order]
     environment:
       MASTER_HOST: redis-master-order
@@ -87,7 +86,6 @@ services:
   redis-sentinel-order:
     image: redis:7.2-bookworm
     container_name: redis-sentinel-order
-    profiles: ["sentinel"]
     restart: unless-stopped
     depends_on:
       - redis-master-order
@@ -114,6 +112,7 @@ services:
       - env/stock_redis.env
     depends_on:
       - redis-master-stock
+      - redis-sentinel-stock
 
   redis-master-stock:
     image: redis:7.2-bookworm
@@ -129,7 +128,6 @@ services:
   redis-replica1-stock:
     <<: *redis-replica
     container_name: redis-replica1-stock
-    profiles: ["sentinel"]
     depends_on: [redis-master-stock]
     environment:
       MASTER_HOST: redis-master-stock
@@ -142,7 +140,6 @@ services:
   redis-replica2-stock:
     <<: *redis-replica
     container_name: redis-replica2-stock
-    profiles: ["sentinel"]
     depends_on: [redis-master-stock]
     environment:
       MASTER_HOST: redis-master-stock
@@ -156,7 +153,6 @@ services:
   redis-sentinel-stock:
     image: redis:7.2-bookworm
     container_name: redis-sentinel-stock
-    profiles: ["sentinel"]
     restart: unless-stopped
     depends_on:
       - redis-master-stock
@@ -184,6 +180,7 @@ services:
       - env/payment_redis.env
     depends_on:
       - redis-master-payment
+      - redis-sentinel-payment
 
   redis-master-payment:
     image: redis:7.2-bookworm
@@ -199,7 +196,6 @@ services:
   redis-replica1-payment:
     <<: *redis-replica
     container_name: redis-replica1-payment
-    profiles: ["sentinel"]
     depends_on: [redis-master-payment]
     environment:
       MASTER_HOST: redis-master-payment
@@ -212,7 +208,6 @@ services:
   redis-replica2-payment:
     <<: *redis-replica
     container_name: redis-replica2-payment
-    profiles: ["sentinel"]
     depends_on: [redis-master-payment]
     environment:
       MASTER_HOST: redis-master-payment
@@ -225,7 +220,6 @@ services:
   redis-sentinel-payment:
     image: redis:7.2-bookworm
     container_name: redis-sentinel-payment
-    profiles: ["sentinel"]
     restart: unless-stopped
     depends_on:
       - redis-master-payment

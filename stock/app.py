@@ -5,7 +5,7 @@ import uuid
 
 import redis
 from redis.exceptions import RedisError
-from redis.sentinel import Sentinel
+from redis_ha import make_redis_client as _make_redis_client
 
 
 from msgspec import msgpack, Struct
@@ -17,54 +17,7 @@ DB_ERROR_STR = "DB error"
 app = Flask("stock-service")
 
 
-def _make_redis_client(
-    host_var: str = "REDIS_HOST",
-    port_var: str = "REDIS_PORT",
-    password_var: str = "REDIS_PASSWORD",
-    db_var: str = "REDIS_DB",
-    sentinels_var: str = "REDIS_SENTINELS",
-    sentinel_master_var: str = "REDIS_MASTER_NAME",
-) -> redis.Redis:
-    sentinels_raw = os.environ.get(sentinels_var)
-    if sentinels_raw:
-        sentinel_addrs: list[tuple[str, int]] = []
-        for part in sentinels_raw.split(","):
-            host, port = part.strip().split(":")
-            sentinel_addrs.append((host, int(port)))
-
-        master_name = os.environ[sentinel_master_var]
-        password = os.environ.get(password_var)
-        db_index = int(os.environ.get(db_var, "0"))
-
-        sentinel = Sentinel(
-            sentinel_addrs,
-            socket_timeout=1.0,
-            sentinel_kwargs={},
-        )
-        return sentinel.master_for(
-            service_name=master_name,
-            password=password,
-            db=db_index,
-            socket_timeout=1.0,
-            retry_on_timeout=True,
-            decode_responses=False,
-        )
-
-    host = os.environ[host_var]
-    port = int(os.environ.get(port_var, "6379"))
-    password = os.environ.get(password_var)
-    db_index = int(os.environ.get(db_var, "0"))
-    return redis.Redis(
-        host=host,
-        port=port,
-        password=password,
-        db=db_index,
-        socket_timeout=1.0,
-        retry_on_timeout=True,
-    )
-
-
-db: redis.Redis = _make_redis_client()
+db = _make_redis_client()
 
 
 
@@ -164,4 +117,3 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-
