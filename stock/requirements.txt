@@ -1,4 +1,4 @@
-kafka-python==2.0.2
+kafka-python-ng
 grpcio==1.78.0
 grpcio-tools==1.78.0
 Flask==3.0.2

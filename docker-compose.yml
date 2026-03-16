@@ -23,7 +23,7 @@ services:
       - PAYMENT_GRPC_HOST=payment-service
       - PAYMENT_GRPC_PORT=50052
       - GATEWAY_URL=http://gateway:80
-      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_BROKERS=kafka:29092
       - TRANSACTION_MODE=saga
       - SAGA_TIMEOUT_SECONDS=10
     command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
@@ -46,7 +46,7 @@ services:
     restart: always
     command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
-      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_BROKERS=kafka:29092
       - KAFKA_COMMAND_TOPIC=stock-commands
       - KAFKA_EVENT_TOPIC=stock-events
     env_file:
@@ -68,7 +68,7 @@ services:
     restart: always
     command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
-      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_BROKERS=kafka:29092
       - KAFKA_COMMAND_TOPIC=payment-commands
       - KAFKA_EVENT_TOPIC=payment-events
     env_file:
