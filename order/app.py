@@ -20,7 +20,10 @@ try:
     from kafka import KafkaProducer, KafkaConsumer
     from kafka.errors import KafkaError, NoBrokersAvailable
     KAFKA_AVAILABLE = True
-except Exception:
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    print("Kafka import failed:", repr(e))
     class KafkaProducer:
         pass
     class KafkaConsumer:
@@ -481,8 +484,8 @@ def _build_saga_start(order_id: str, order_entry: OrderValue) -> tuple[dict, dic
     items = [{"item_id": item_id, "quantity": quantity} for item_id, quantity in items_quantities.items()]
 
     attempt_id = str(uuid.uuid4())
-    stock_idem_key = str(uuid.uuid4())
-    payment_idem_key = str(uuid.uuid4())
+    stock_idem_key = f"reserve-stock:{order_id}" # key is now stable with order id
+    payment_idem_key = f"charge-payment:{order_id}"
     lock_token = str(uuid.uuid4())
 
     state = {
@@ -1152,6 +1155,40 @@ def checkout(order_id: str):
         _release_saga_lock(order_id, state.get("lock_token"))
 
     if not ok:
+        if state and state.get("status") not in ("completed", "failed"):
+            step = state.get("step")
+            if step == "charge_payment":
+                # payment fails -> compensate
+                state["status"] = "compensating"
+                state["step"] = "rollback_payment"
+                state["reason"] = reason
+                state["last_updated"] = time.time()
+                set_saga_state(order_id, state)
+
+                command = {
+                    "message_id": str(uuid.uuid4()),
+                    "type": "RollbackPayment",
+                    "saga_id": order_id,
+                    "order_id": state["order_id"],
+                    "attempt_id": state.get("attempt_id", ""),
+                    "user_id": state["user_id"],
+                    "amount": state["total_cost"],
+                    "idempotency_key": state["payment_idem_key"],
+                }
+                _send_with_retry(PAYMENT_COMMAND_TOPIC, command)
+
+            else:
+                # reserve_stock timeout or early failure (maybe not necessary)
+                state["status"] = "failed"
+                state["step"] = "done"
+                state["reason"] = reason
+                state["last_updated"] = time.time()
+                set_saga_state(order_id, state)
+
+                _notify_saga_done(order_id, f"failed:{reason}")
+                _release_saga_lock(order_id, state.get("lock_token"))
+                _expire_saga_keys(order_id)
+
         return abort(400, reason)
 
     return Response("Checkout successful", status=200)
