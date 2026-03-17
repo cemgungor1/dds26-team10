@@ -21,9 +21,6 @@ try:
     from kafka.errors import KafkaError, NoBrokersAvailable
     KAFKA_AVAILABLE = True
 except Exception as e:
-    import traceback
-    traceback.print_exc()
-    print("Kafka import failed:", repr(e))
     class KafkaProducer:
         pass
     class KafkaConsumer:
@@ -484,8 +481,8 @@ def _build_saga_start(order_id: str, order_entry: OrderValue) -> tuple[dict, dic
     items = [{"item_id": item_id, "quantity": quantity} for item_id, quantity in items_quantities.items()]
 
     attempt_id = str(uuid.uuid4())
-    stock_idem_key = f"reserve-stock:{order_id}" # key is now stable with order id
-    payment_idem_key = f"charge-payment:{order_id}"
+    stock_idem_key = str(uuid.uuid4())
+    payment_idem_key = str(uuid.uuid4())
     lock_token = str(uuid.uuid4())
 
     state = {
