@@ -72,13 +72,13 @@ class TestFailureResilience(unittest.TestCase):
             response = tu.checkout_order(order['order_id'])
             self.assertTrue(tu.status_code_is_failure(response.status_code))
 
-            # Stock should be rolled back
-            stock_after = tu.find_item(item['item_id'])['stock']
-            self.assertEqual(stock_after, stock_before)
         finally:
             # Start back the payment service
             self._start_service("payment-service")
-
+        
+        time.sleep(15) # wait for rollback
+        stock_after = tu.find_item(item['item_id'])['stock']
+        self.assertEqual(stock_after, stock_before)
     def test_stock_service_recovers(self):
         # Restart stock service
         self._stop_service("stock-service")
