@@ -1156,7 +1156,7 @@ def checkout(order_id: str):
         step = state.get("step")
 
         if step == "reserve_stock":
-            _finish_saga_failed(
+            _transition_to_rollback_stock(
                 order_id,
                 state,
                 reason or "Checkout timed out",
