@@ -3,7 +3,7 @@ import time
 import requests
 
 URLS = [
-    "http://127.0.0.1:8000/order/health",
+    "http://127.0.0.1:8000/orders/health",
     "http://127.0.0.1:8000/payment/health",
     "http://127.0.0.1:8000/stock/health",
 ]
