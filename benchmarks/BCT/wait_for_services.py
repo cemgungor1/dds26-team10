@@ -31,6 +31,7 @@ def main() -> int:
             print(f"Timed out waiting for {url}")
             return 1
         print(f"Ready: {url}")
+    time.sleep(10) # kafka wait hacky oops
     return 0
 
 
