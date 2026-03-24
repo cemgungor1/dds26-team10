@@ -1135,6 +1135,18 @@ def checkout(order_id: str):
     # Sync fallback when Kafka is unavailable
     if TRANSACTION_MODE == "sync":
         return checkout_sync(order_id)
+    
+    # Handle empty items list in checkout
+    order_entry = get_order_from_db(order_id)
+    if not order_entry.items:
+        if order_entry.paid:
+            return Response("Order already paid", status=200)
+        order_entry.paid = True
+        try:
+            db.set(order_id, msgpack.encode(order_entry))
+        except redis.exceptions.RedisError:
+            return abort(400, DB_ERROR_STR)
+        return Response("Checkout successful", status=200)
 
     started, reason = _start_saga(order_id)
     if not started:
@@ -1185,7 +1197,7 @@ def checkout(order_id: str):
                 reason or "Checkout timed out",
             )
                 
-    abort(400, reason)
+    return abort(400, reason)
 
 
 _background_services_started = False
