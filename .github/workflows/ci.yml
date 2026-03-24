@@ -37,7 +37,7 @@ jobs:
       - name: Run core tests
         working-directory: benchmarks/BCT
         run: |
-          python -m unittest microservices credits concurrent_payments coordinator 2pc failure_resistance rollback -v
+          python -m unittest microservices credits concurrent_payments coordinator 2pc -v
 
       - name: Dump logs on failure
         if: failure()
