@@ -7,9 +7,11 @@ import time
 import uuid
 
 import redis
+from redis.exceptions import RedisError
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+
 try:
     from kafka import KafkaProducer, KafkaConsumer
     from kafka.errors import KafkaError, NoBrokersAvailable
@@ -428,6 +430,97 @@ def start_background_services() -> None:
             return
         _start_command_consumer()
         _background_services_started = True
+
+# 2PC functions for Payment App
+
+# Prepare phase - Acquire lock and verify credit
+@app.post('/prepare/pay/<user_id>/<amount>/<transaction_id>')
+def prepare_pay(user_id: str, amount: int, transaction_id: str):
+    app.logger(f"Prepare phase for Payment Service {user_id}")
+
+    lock_key = f"lock:user:{user_id}"
+    lock_value = transaction_id
+
+    # Try to acquire lock
+    locked = db.set(lock_key, lock_value, nx=True, ex=300) # Expire after 5 mins
+    if not locked:
+        return Response(f"User account locked by another transaction", status=409)
+
+    # Now that we have the lock, we check for credit
+    try:
+        user_entry: UserValue = get_user_from_db(user_id)
+    except:
+        db.delete(lock_key)
+        raise
+
+    # check if sufficient amount is present
+    if user_entry.credit < amount:
+        return Response(f"Insufficient credit for user {user_id}")
+    
+    # Store the payment reservation with lock held
+    reservation_key = f"payment_reservation:{transaction_id}"
+    reservation_data = msgpack.encode({"user_id": user_id, "amount": int(amount)})
+    try:
+        db.setex(reservation_key, 300, reservation_data)  # 5 min TTL
+    except redis.exceptions.RedisError:
+        db.delete(lock_key)  # Release lock on error
+        return abort(400, DB_ERROR_STR)
+    
+    app.logger.debug(f"Payment prepared for user {user_id}, transaction {transaction_id}")
+    return Response("PREPARED", status=200)
+
+# COMMIT phase - Deduct credit and release lock
+@app.post('/commit/pay/<transaction_id>')
+def commit_pay(transaction_id: str):
+    reservation_key = f"payment_reservation:{transaction_id}"
+    reservation_data = db.get(reservation_key)
+    
+    if not reservation_data:
+        return abort(400, "Transaction not found")
+    
+    data = msgpack.decode(reservation_data, type=dict)
+    user_id = data["user_id"]
+    amount = data["amount"]
+    
+    # Perform the actual credit deduction
+    user_entry: UserValue = get_user_from_db(user_id)
+    user_entry.credit -= amount
+    
+    try:
+        db.set(user_id, msgpack.encode(user_entry))
+        db.delete(reservation_key)
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    
+    # Release the lock
+    lock_key = f"lock:user:{user_id}"
+    db.delete(lock_key)
+    
+    app.logger.debug(f"Payment committed for user {user_id}, transaction {transaction_id}")
+    return Response("COMMITTED", status=200)
+
+# ABORT phase - Release reservation and lock
+@app.post('/abort/pay/<transaction_id>')
+def abort_pay(transaction_id: str):
+    reservation_key = f"payment_reservation:{transaction_id}"
+    reservation_data = db.get(reservation_key)
+    
+    if reservation_data:
+        data = msgpack.decode(reservation_data, type=dict)
+        user_id = data["user_id"]
+        
+        # Release lock
+        lock_key = f"lock:user:{user_id}"
+        # Only delete if this transaction owns the lock
+        lock_owner = db.get(lock_key)
+        if lock_owner and lock_owner.decode() == transaction_id:
+            db.delete(lock_key)
+        
+        db.delete(reservation_key)
+    
+    app.logger.debug(f"Payment aborted for transaction {transaction_id}")
+    return Response("ABORTED", status=200)
+
 
 
 if __name__ == '__main__':

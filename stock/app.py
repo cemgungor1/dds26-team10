@@ -7,6 +7,7 @@ import time
 import uuid
 
 import redis
+from redis.exceptions import RedisError
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -444,6 +445,93 @@ def start_background_services() -> None:
             return
         _start_command_consumer()
         _background_services_started = True
+
+# 2PC functions for Stock App
+# PREPARE phase - Acquire lock and verify stock
+@app.post('/prepare/subtract/<item_id>/<amount>/<transaction_id>')
+def prepare_subtract(item_id: str, amount: int, transaction_id: str):
+    lock_key = f"lock:item:{item_id}"
+    lock_value = transaction_id
+    
+    # Try to acquire exclusive lock on item
+    locked = db.set(lock_key, lock_value, nx=True, ex=300)  # 5 min expiry
+    if not locked:
+        # Another transaction has locked this item
+        return Response(f"Item locked by another transaction", status=409)
+    
+    # Now we have exclusive access - check stock
+    try:
+        item_entry: StockValue = get_item_from_db(item_id)
+    except:
+        db.delete(lock_key)  # Release lock on error
+        raise
+    
+    if item_entry.stock < int(amount):
+        db.delete(lock_key)  # Release lock
+        return Response(f"Insufficient stock for item: {item_id}", status=400)
+    
+    # Store the reservation with lock held
+    reservation_key = f"stock_reservation:{transaction_id}:{item_id}"
+    try:
+        db.setex(reservation_key, 300, str(amount))  # 5 min TTL
+    except redis.exceptions.RedisError:
+        db.delete(lock_key)  # Release lock on error
+        return abort(400, DB_ERROR_STR)
+    
+    app.logger.debug(f"Stock prepared for item {item_id}, transaction {transaction_id}")
+    return Response("PREPARED", status=200)
+
+
+# COMMIT phase - Subtract stock and release locks
+@app.post('/commit/subtract/<transaction_id>')
+def commit_subtract(transaction_id: str):
+    # Find all reservations for this transaction
+    pattern = f"stock_reservation:{transaction_id}:*"
+    keys = db.keys(pattern)
+    
+    for key in keys:
+        item_id = key.decode().split(":")[-1]
+        amount = int(db.get(key))
+        
+        # Perform the actual stock subtraction
+        item_entry: StockValue = get_item_from_db(item_id)
+        item_entry.stock -= amount
+        
+        try:
+            db.set(item_id, msgpack.encode(item_entry))
+            db.delete(key)  # Remove reservation
+        except redis.exceptions.RedisError:
+            return abort(400, DB_ERROR_STR)
+        
+        # Release the lock
+        lock_key = f"lock:item:{item_id}"
+        db.delete(lock_key)
+        
+        app.logger.debug(f"Stock committed for item {item_id}, new stock: {item_entry.stock}")
+    
+    return Response("COMMITTED", status=200)
+
+
+# ABORT phase - Release reservations and locks
+@app.post('/abort/subtract/<transaction_id>')
+def abort_subtract(transaction_id: str):
+    pattern = f"stock_reservation:{transaction_id}:*"
+    keys = db.keys(pattern)
+    
+    for key in keys:
+        item_id = key.decode().split(":")[-1]
+        
+        # Release lock - only if this transaction owns it
+        lock_key = f"lock:item:{item_id}"
+        lock_owner = db.get(lock_key)
+        if lock_owner and lock_owner.decode() == transaction_id:
+            db.delete(lock_key)
+        
+        db.delete(key)  # Remove reservation
+    
+    app.logger.debug(f"Stock aborted for transaction {transaction_id}")
+    return Response("ABORTED", status=200)
+
 
 
 if __name__ == '__main__':

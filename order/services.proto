@@ -7,6 +7,19 @@ service StockService
   rpc FindItem (FindItemRequest) returns (FindItemReply);
   rpc SubtractStock (SubtractStockRequest) returns (StockReply);
   rpc AddStock (AddStockRequest) returns (StockReply);
+  // 2-Phase Commit methods
+  rpc PrepareSubtract (PrepareSubtractRequest) returns (PrepareReply);
+  rpc CommitSubtract (CommitRequest) returns (CommitReply);
+  rpc AbortSubtract (AbortRequest) returns (AbortReply);
+}
+
+service PaymentService 
+{ // Remote Procedure Calls for PaymentService
+  rpc Pay (PayRequest) returns (PayReply);
+  // 2-Phase Commit methods
+  rpc PreparePay (PreparePayRequest) returns (PrepareReply);
+  rpc CommitPay (CommitRequest) returns (CommitReply);
+  rpc AbortPay (AbortRequest) returns (AbortReply);
 }
 
 message FindItemRequest 
@@ -39,16 +52,52 @@ message StockReply
   string message = 2;
 }
 
-service PaymentService 
-{ // Remote Procedure Calls for PaymentService
-  rpc Pay (PayRequest) returns (PayReply);
-  rpc Refund (PayRequest) returns (PayReply);
+message PrepareSubtractRequest
+{ // Prepare phase for stock 2PC
+  string item_id = 1;
+  int32 quantity = 2;
+  string transaction_id = 3;
+}
+
+message PrepareReply
+{ // Reply for prepare phase
+  bool success = 1;
+  string message = 2;
+}
+
+message CommitRequest
+{ // Commit phase for 2PC
+  string transaction_id = 1;
+}
+
+message CommitReply
+{ // Reply for commit phase
+  bool success = 1;
+  string message = 2;
+}
+
+message AbortRequest
+{ // Abort phase for 2PC
+  string transaction_id = 1;
+}
+
+message AbortReply
+{ // Reply for abort phase
+  bool success = 1;
+  string message = 2;
 }
 
 message PayRequest 
 { // Request a payment amount for a user
   string user_id = 1;
   int32  amount  = 2;
+}
+
+message PreparePayRequest
+{ // Prepare phase for payment 2PC
+  string user_id = 1;
+  int32 amount = 2;
+  string transaction_id = 3;
 }
 
 message PayReply 

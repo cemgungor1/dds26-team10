@@ -9,12 +9,14 @@ import uuid
 from collections import defaultdict
 
 import redis
+from redis.exceptions import RedisError
 import grpc
 import services_pb2
 from grpc_clients import stock_stub, payment_stub
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+from typing import Any
 
 try:
     from kafka import KafkaProducer, KafkaConsumer
@@ -29,6 +31,8 @@ except Exception as e:
     NoBrokersAvailable = Exception
     KAFKA_AVAILABLE = False
 
+# Variable for 2PC
+CHECKOUT_METHOD = os.getenv("CHECKOUT_METHOD", "2PC").upper()
 
 DB_ERROR_STR = "DB error"
 
@@ -397,6 +401,123 @@ def add_item(order_id: str, item_id: str, quantity: int):
             continue
     return abort(400, DB_ERROR_STR)
 
+# 2PC Checkout
+
+def checkout_2pc(order_id: str) -> Response:
+    transaction_id = str(uuid.uuid4())
+    app.logger.debug(f"Starting pessimistic 2PC checkout for order {order_id} with transaction {transaction_id}")
+
+    order_entry: OrderValue = get_order_from_db(order_id)
+
+    # Aggregate items
+    items_quantities: dict[str, int] = defaultdict(int)
+    for item_id, quantity in order_entry.items:
+        items_quantities[item_id] += quantity
+
+    # Track which resources we've prepared (for cleanup on failure)
+    prepared_items = []
+    payment_prepared = False
+
+    # Log PREPARE
+    log_transaction(
+        transaction_id,
+        STATE_PREPARE,
+        {
+            "order_id": order_id,
+            "user_id": order_entry.user_id,
+            "total_cost": order_entry.total_cost,
+            "items": dict(items_quantities),
+        }
+    )
+
+    try:
+        # ========== PHASE 1: PREPARE ==========
+        # All participants acquire locks and verify they can commit
+
+        # 1a. Prepare all stock items
+        app.logger.debug(f"Preparing stock for {len(items_quantities)} items")
+        for item_id, quantity in items_quantities.items():
+            try:
+                prepare_reply = stock_stub.PrepareSubtract(
+                    services_pb2.PrepareSubtractRequest(
+                        item_id=item_id,
+                        quantity=quantity,
+                        transaction_id=transaction_id
+                    )
+                )
+            except grpc.RpcError as e:
+                # PREPARE failed - abort all prepared resources
+                app.logger.warning(f"Stock prepare failed for item {item_id}: {e.details()}")
+                abort(400, f'Cannot prepare stock for item {item_id}: {e.details()}')
+
+            if not prepare_reply.success:
+                # PREPARE failed - abort all prepared resources
+                app.logger.warning(f"Stock prepare failed for item {item_id}: {prepare_reply.message}")
+                abort(400, f'Cannot prepare stock for item {item_id}: {prepare_reply.message}')
+
+            prepared_items.append(item_id)
+            app.logger.debug(f"Stock prepared for item {item_id}")
+
+        # 1b. Prepare payment
+        app.logger.debug(f"Preparing payment for user {order_entry.user_id}")
+        try:
+            payment_prepare_reply = payment_stub.PreparePay(
+                services_pb2.PreparePayRequest(
+                    user_id=order_entry.user_id,
+                    amount=order_entry.total_cost,
+                    transaction_id=transaction_id
+                )
+            )
+        except grpc.RpcError as e:
+            # Payment PREPARE failed - abort all prepared stock
+            app.logger.warning(f"Payment prepare failed: {e.details()}")
+            abort(400, f"Cannot prepare payment: {e.details()}")
+
+        if not payment_prepare_reply.success:
+            # Payment PREPARE failed - abort all prepared stock
+            app.logger.warning(f"Payment prepare failed: {payment_prepare_reply.message}")
+            abort(400, f"Cannot prepare payment: {payment_prepare_reply.message}")
+
+        payment_prepared = True
+        app.logger.debug(f"Payment prepared for user {order_entry.user_id}")
+
+        # ========== PHASE 2: COMMIT ==========
+        # All participants voted YES - now commit all changes
+
+        # Log COMMIT decision, this is the COMMIT POINT
+        log_transaction(
+            transaction_id,
+            STATE_COMMIT,
+            {
+                "order_id": order_id,
+                "user_id": order_entry.user_id,
+                "total_cost": order_entry.total_cost,
+                "items": dict(items_quantities),
+            }
+        )
+
+        _execute_commit_2pc(transaction_id, order_id, order_entry)
+
+        # Clean up log after successful commit
+        delete_transaction_log(transaction_id)
+
+        app.logger.debug(f"Transaction {transaction_id} committed successfully")
+        return Response("Checkout successful", status=200)
+
+    except Exception as e:
+        # ========== ABORT on any failure ==========
+        app.logger.error(f"Transaction {transaction_id} aborted: {str(e)}")
+
+        # Abort if we haven't reached the COMMIT POINT in the logs
+        txn_log = get_transaction_log(transaction_id)
+        if txn_log and txn_log["state"] != STATE_COMMIT:
+            log_transaction(transaction_id, STATE_ABORT, {})
+            _execute_abort_2pc(transaction_id, prepared_items, payment_prepared)
+            delete_transaction_log(transaction_id)
+
+
+        # Re-raise the exception to return error to client
+        raise
 
 # ─── Sync Checkout (fallback when Kafka is unavailable) ─────────────────────
 
@@ -1135,6 +1256,10 @@ def checkout(order_id: str):
     # Sync fallback when Kafka is unavailable
     if TRANSACTION_MODE == "sync":
         return checkout_sync(order_id)
+
+    # Determine Checkout Mode
+    if CHECKOUT_METHOD == "2pc":
+        return checkout_2pc(order_id)
     
     # Handle empty items list in checkout
     order_entry = get_order_from_db(order_id)
