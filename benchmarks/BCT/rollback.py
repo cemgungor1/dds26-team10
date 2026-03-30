@@ -243,8 +243,14 @@ class TestRollback(unittest.TestCase):
         user_id = user["user_id"]
         tu.add_credit_to_user(user_id, 100)
  
+        item = tu.create_item(10)
+        item_id = item["item_id"]
+        tu.add_stock(item_id, 20)
+ 
         order = tu.create_order(user_id)
         order_id = order["order_id"]
+        tu.add_item_to_order(order_id, item_id, 1)
+ 
  
         initial_credit = tu.find_user(user_id)["credit"]
  
