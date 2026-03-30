@@ -1,0 +1,19 @@
+version: "3"
+# Large configuration: 5 instances each
+# Usage: docker compose -f docker-compose.yml -f docker-compose.large.yml up -d
+
+services:
+  order-service:
+    deploy:
+      mode: replicated
+      replicas: 5
+
+  stock-service:
+    deploy:
+      mode: replicated
+      replicas: 5
+
+  payment-service:
+    deploy:
+      mode: replicated
+      replicas: 5
