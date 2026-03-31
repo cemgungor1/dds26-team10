@@ -18,6 +18,7 @@ services:
     image: order:latest
     restart: always
     environment:
+      - CHECKOUT_METHOD=2PC
       - STOCK_GRPC_HOST=stock-service
       - STOCK_GRPC_PORT=50051
       - PAYMENT_GRPC_HOST=payment-service

@@ -7,6 +7,7 @@ import time
 import uuid
 
 import redis
+from redis.exceptions import RedisError
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
@@ -33,6 +34,9 @@ KAFKA_EVENT_TOPIC = os.environ.get("KAFKA_EVENT_TOPIC", "stock-events")
 PROCESSED_MSG_PREFIX = "stock:processed:"
 STOCK_RESERVED_PREFIX = "stock:reserved:"
 STOCK_ROLLEDBACK_PREFIX = "stock:rolledback:"
+STOCK_2PC_PREPARED_PREFIX = "stock:2pc:prepared:"
+STOCK_2PC_COMMITTED_PREFIX = "stock:2pc:committed:"
+STOCK_2PC_ABORTED_PREFIX = "stock:2pc:aborted:"
 IDEMPOTENCY_TTL = int(os.environ.get("IDEMPOTENCY_TTL", "3600"))
 
 app = Flask("stock-service")
@@ -300,6 +304,111 @@ def _rollback_stock(items: list[dict], rolled_key: str = None, reserved_key_to_d
     return False, "Concurrent modification"
 
 
+def _release_stock_locks(transaction_id: str, items: list[dict]) -> None:
+    for item in items:
+        item_id = item["item_id"]
+        lock_key = f"lock:item:{item_id}"
+        try:
+            lock_owner = db.get(lock_key)
+            if lock_owner and lock_owner.decode("utf-8") == transaction_id:
+                db.delete(lock_key)
+        except redis.exceptions.RedisError:
+            continue
+
+
+def _prepare_stock_2pc(items: list[dict], transaction_id: str, prepared_key: str) -> tuple[bool, str]:
+    acquired_items: list[str] = []
+    for item in items:
+        item_id = item["item_id"]
+        lock_key = f"lock:item:{item_id}"
+        try:
+            lock_owner = db.get(lock_key)
+            if lock_owner and lock_owner.decode("utf-8") != transaction_id:
+                _release_stock_locks(transaction_id, [{"item_id": i, "quantity": 0} for i in acquired_items])
+                return False, f"Item locked by another transaction: {item_id}"
+            if not db.set(lock_key, transaction_id, nx=True, ex=300):
+                lock_owner = db.get(lock_key)
+                if not lock_owner or lock_owner.decode("utf-8") != transaction_id:
+                    _release_stock_locks(transaction_id, [{"item_id": i, "quantity": 0} for i in acquired_items])
+                    return False, f"Item locked by another transaction: {item_id}"
+            acquired_items.append(item_id)
+        except redis.exceptions.RedisError:
+            _release_stock_locks(transaction_id, [{"item_id": i, "quantity": 0} for i in acquired_items])
+            return False, "DB error"
+
+    for item in items:
+        item_id = item["item_id"]
+        quantity = int(item["quantity"])
+        entry = _get_item_entry(item_id)
+        if entry is None:
+            _release_stock_locks(transaction_id, items)
+            return False, f"Item {item_id} not found"
+        if entry.stock < quantity:
+            _release_stock_locks(transaction_id, items)
+            return False, f"Insufficient stock for {item_id}"
+
+    try:
+        db.set(prepared_key, json.dumps(items), ex=IDEMPOTENCY_TTL)
+    except redis.exceptions.RedisError:
+        _release_stock_locks(transaction_id, items)
+        return False, "DB error"
+    return True, ""
+
+
+def _commit_stock_2pc(items: list[dict], transaction_id: str, prepared_key: str, committed_key: str) -> tuple[bool, str]:
+    item_ids = [item["item_id"] for item in items]
+    retries = 3
+    while retries > 0:
+        retries -= 1
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(*item_ids)
+                entries: dict[str, StockValue] = {}
+                for item in items:
+                    item_id = item["item_id"]
+                    entry = _get_item_entry(item_id)
+                    if entry is None:
+                        pipe.unwatch()
+                        return False, f"Item {item_id} not found"
+                    quantity = int(item["quantity"])
+                    if entry.stock < quantity:
+                        pipe.unwatch()
+                        return False, f"Insufficient stock for {item_id}"
+                    entries[item_id] = entry
+
+                pipe.multi()
+                for item in items:
+                    item_id = item["item_id"]
+                    quantity = int(item["quantity"])
+                    entry = entries[item_id]
+                    entry.stock -= quantity
+                    pipe.set(item_id, msgpack.encode(entry))
+                pipe.set(committed_key, "1", ex=IDEMPOTENCY_TTL)
+                pipe.delete(prepared_key)
+                pipe.execute()
+                break
+        except redis.exceptions.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return False, "DB error"
+    else:
+        return False, "Concurrent modification"
+
+    _release_stock_locks(transaction_id, items)
+    return True, ""
+
+
+def _abort_stock_2pc(items: list[dict], transaction_id: str, prepared_key: str, aborted_key: str) -> tuple[bool, str]:
+    try:
+        db.set(aborted_key, "1", ex=IDEMPOTENCY_TTL)
+        db.delete(prepared_key)
+    except redis.exceptions.RedisError:
+        return False, "DB error"
+
+    _release_stock_locks(transaction_id, items)
+    return True, ""
+
+
 def _handle_command(command: dict) -> None:
     message_id = command.get("message_id")
     if not message_id:
@@ -311,7 +420,107 @@ def _handle_command(command: dict) -> None:
     attempt_id = command.get("attempt_id", "")
     idem_key = command.get("idempotency_key", order_id)
     items = command.get("items", [])
+    transaction_id = command.get("transaction_id")
     if not order_id:
+        return
+
+    # ── PrepareStock (2PC) ───────────────────────────────────────────────
+    if command_type == "PrepareStock":
+        if _message_processed(message_id):
+            return
+        if not transaction_id:
+            return
+
+        prepared_key = f"{STOCK_2PC_PREPARED_PREFIX}{transaction_id}"
+        committed_key = f"{STOCK_2PC_COMMITTED_PREFIX}{transaction_id}"
+        try:
+            if db.exists(committed_key):
+                ok, reason = True, "Already committed"
+            elif db.exists(prepared_key):
+                ok, reason = True, "Already prepared"
+            else:
+                ok, reason = _prepare_stock_2pc(items, transaction_id, prepared_key)
+        except redis.exceptions.RedisError:
+            ok, reason = False, "DB error"
+
+        event = {
+            "message_id": str(uuid.uuid4()),
+            "type": "PrepareStockResult",
+            "order_id": order_id,
+            "transaction_id": transaction_id,
+            "attempt_id": attempt_id,
+            "success": ok,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if send_event(event):
+            _mark_message_processed(message_id)
+        return
+
+    # ── CommitStock (2PC) ────────────────────────────────────────────────
+    if command_type == "CommitStock":
+        if _message_processed(message_id):
+            return
+        if not transaction_id:
+            return
+
+        prepared_key = f"{STOCK_2PC_PREPARED_PREFIX}{transaction_id}"
+        committed_key = f"{STOCK_2PC_COMMITTED_PREFIX}{transaction_id}"
+        try:
+            if db.exists(committed_key):
+                ok, reason = True, "Already committed"
+            elif not db.exists(prepared_key):
+                ok, reason = True, "No reservation"
+            else:
+                ok, reason = _commit_stock_2pc(items, transaction_id, prepared_key, committed_key)
+        except redis.exceptions.RedisError:
+            ok, reason = False, "DB error"
+
+        event = {
+            "message_id": str(uuid.uuid4()),
+            "type": "CommitStockResult",
+            "order_id": order_id,
+            "transaction_id": transaction_id,
+            "attempt_id": attempt_id,
+            "success": ok,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if send_event(event):
+            _mark_message_processed(message_id)
+        return
+
+    # ── AbortStock (2PC) ─────────────────────────────────────────────────
+    if command_type == "AbortStock":
+        if _message_processed(message_id):
+            return
+        if not transaction_id:
+            return
+
+        prepared_key = f"{STOCK_2PC_PREPARED_PREFIX}{transaction_id}"
+        aborted_key = f"{STOCK_2PC_ABORTED_PREFIX}{transaction_id}"
+        try:
+            if db.exists(aborted_key):
+                ok, reason = True, "Already aborted"
+            elif not db.exists(prepared_key):
+                ok, reason = True, "No reservation"
+            else:
+                ok, reason = _abort_stock_2pc(items, transaction_id, prepared_key, aborted_key)
+        except redis.exceptions.RedisError:
+            ok, reason = False, "DB error"
+
+        event = {
+            "message_id": str(uuid.uuid4()),
+            "type": "AbortStockResult",
+            "order_id": order_id,
+            "transaction_id": transaction_id,
+            "attempt_id": attempt_id,
+            "success": ok,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if send_event(event):
+            _mark_message_processed(message_id)
         return
 
     # ── ReserveStock ──────────────────────────────────────────────────────
@@ -444,6 +653,93 @@ def start_background_services() -> None:
             return
         _start_command_consumer()
         _background_services_started = True
+
+# 2PC functions for Stock App
+# PREPARE phase - Acquire lock and verify stock
+@app.post('/prepare/subtract/<item_id>/<amount>/<transaction_id>')
+def prepare_subtract(item_id: str, amount: int, transaction_id: str):
+    lock_key = f"lock:item:{item_id}"
+    lock_value = transaction_id
+    
+    # Try to acquire exclusive lock on item
+    locked = db.set(lock_key, lock_value, nx=True, ex=300)  # 5 min expiry
+    if not locked:
+        # Another transaction has locked this item
+        return Response(f"Item locked by another transaction", status=409)
+    
+    # Now we have exclusive access - check stock
+    try:
+        item_entry: StockValue = get_item_from_db(item_id)
+    except:
+        db.delete(lock_key)  # Release lock on error
+        raise
+    
+    if item_entry.stock < int(amount):
+        db.delete(lock_key)  # Release lock
+        return Response(f"Insufficient stock for item: {item_id}", status=400)
+    
+    # Store the reservation with lock held
+    reservation_key = f"stock_reservation:{transaction_id}:{item_id}"
+    try:
+        db.setex(reservation_key, 300, str(amount))  # 5 min TTL
+    except redis.exceptions.RedisError:
+        db.delete(lock_key)  # Release lock on error
+        return abort(400, DB_ERROR_STR)
+    
+    app.logger.debug(f"Stock prepared for item {item_id}, transaction {transaction_id}")
+    return Response("PREPARED", status=200)
+
+
+# COMMIT phase - Subtract stock and release locks
+@app.post('/commit/subtract/<transaction_id>')
+def commit_subtract(transaction_id: str):
+    # Find all reservations for this transaction
+    pattern = f"stock_reservation:{transaction_id}:*"
+    keys = db.keys(pattern)
+    
+    for key in keys:
+        item_id = key.decode().split(":")[-1]
+        amount = int(db.get(key))
+        
+        # Perform the actual stock subtraction
+        item_entry: StockValue = get_item_from_db(item_id)
+        item_entry.stock -= amount
+        
+        try:
+            db.set(item_id, msgpack.encode(item_entry))
+            db.delete(key)  # Remove reservation
+        except redis.exceptions.RedisError:
+            return abort(400, DB_ERROR_STR)
+        
+        # Release the lock
+        lock_key = f"lock:item:{item_id}"
+        db.delete(lock_key)
+        
+        app.logger.debug(f"Stock committed for item {item_id}, new stock: {item_entry.stock}")
+    
+    return Response("COMMITTED", status=200)
+
+
+# ABORT phase - Release reservations and locks
+@app.post('/abort/subtract/<transaction_id>')
+def abort_subtract(transaction_id: str):
+    pattern = f"stock_reservation:{transaction_id}:*"
+    keys = db.keys(pattern)
+    
+    for key in keys:
+        item_id = key.decode().split(":")[-1]
+        
+        # Release lock - only if this transaction owns it
+        lock_key = f"lock:item:{item_id}"
+        lock_owner = db.get(lock_key)
+        if lock_owner and lock_owner.decode() == transaction_id:
+            db.delete(lock_key)
+        
+        db.delete(key)  # Remove reservation
+    
+    app.logger.debug(f"Stock aborted for transaction {transaction_id}")
+    return Response("ABORTED", status=200)
+
 
 
 if __name__ == '__main__':

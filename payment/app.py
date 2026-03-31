@@ -7,9 +7,11 @@ import time
 import uuid
 
 import redis
+from redis.exceptions import RedisError
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+
 try:
     from kafka import KafkaProducer, KafkaConsumer
     from kafka.errors import KafkaError, NoBrokersAvailable
@@ -32,6 +34,9 @@ KAFKA_EVENT_TOPIC = os.environ.get("KAFKA_EVENT_TOPIC", "payment-events")
 PROCESSED_MSG_PREFIX = "payment:processed:"
 PAYMENT_CHARGED_PREFIX = "payment:charged:"
 PAYMENT_ROLLEDBACK_PREFIX = "payment:rolledback:"
+PAYMENT_2PC_PREPARED_PREFIX = "payment:2pc:prepared:"
+PAYMENT_2PC_COMMITTED_PREFIX = "payment:2pc:committed:"
+PAYMENT_2PC_ABORTED_PREFIX = "payment:2pc:aborted:"
 IDEMPOTENCY_TTL = int(os.environ.get("IDEMPOTENCY_TTL", "3600"))
 
 
@@ -275,6 +280,112 @@ def _rollback_payment(user_id: str, amount: int, rolled_key: str, charged_key: s
     return False, "Concurrent modification"
 
 
+def _prepare_payment_2pc(user_id: str, amount: int, transaction_id: str, prepared_key: str) -> tuple[bool, str]:
+    lock_key = f"lock:user:{user_id}"
+    try:
+        lock_owner = db.get(lock_key)
+        if lock_owner and lock_owner.decode("utf-8") != transaction_id:
+            return False, "User account locked by another transaction"
+    except redis.exceptions.RedisError:
+        return False, "DB error"
+
+    try:
+        if not db.set(lock_key, transaction_id, nx=True, ex=300):
+            lock_owner = db.get(lock_key)
+            if not lock_owner or lock_owner.decode("utf-8") != transaction_id:
+                return False, "User account locked by another transaction"
+    except redis.exceptions.RedisError:
+        return False, "DB error"
+
+    user_entry = _get_user_entry(user_id)
+    if user_entry is None:
+        try:
+            db.delete(lock_key)
+        except redis.exceptions.RedisError:
+            pass
+        return False, "User not found"
+
+    if user_entry.credit < int(amount):
+        try:
+            owner = db.get(lock_key)
+            if owner and owner.decode("utf-8") == transaction_id:
+                db.delete(lock_key)
+        except redis.exceptions.RedisError:
+            pass
+        return False, "User out of credit"
+
+    payload = json.dumps({"user_id": user_id, "amount": int(amount), "transaction_id": transaction_id})
+    try:
+        db.set(prepared_key, payload, ex=IDEMPOTENCY_TTL)
+    except redis.exceptions.RedisError:
+        try:
+            owner = db.get(lock_key)
+            if owner and owner.decode("utf-8") == transaction_id:
+                db.delete(lock_key)
+        except redis.exceptions.RedisError:
+            pass
+        return False, "DB error"
+    return True, ""
+
+
+def _commit_payment_2pc(user_id: str, amount: int, transaction_id: str, prepared_key: str, committed_key: str) -> tuple[bool, str]:
+    retries = 3
+    while retries > 0:
+        retries -= 1
+        try:
+            with db.pipeline() as pipe:
+                pipe.watch(user_id)
+                user_entry = _get_user_entry(user_id)
+                if user_entry is None:
+                    pipe.unwatch()
+                    return False, "User not found"
+                if user_entry.credit < int(amount):
+                    pipe.unwatch()
+                    return False, "User out of credit"
+                user_entry.credit -= int(amount)
+                pipe.multi()
+                pipe.set(user_id, msgpack.encode(user_entry))
+                pipe.set(committed_key, "1", ex=IDEMPOTENCY_TTL)
+                pipe.delete(prepared_key)
+                pipe.execute()
+                break
+        except redis.exceptions.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return False, "DB error"
+    else:
+        return False, "Concurrent modification"
+
+    lock_key = f"lock:user:{user_id}"
+    try:
+        lock_owner = db.get(lock_key)
+        if lock_owner and lock_owner.decode("utf-8") == transaction_id:
+            db.delete(lock_key)
+    except redis.exceptions.RedisError:
+        return False, "DB error"
+    return True, ""
+
+
+def _abort_payment_2pc(user_id: str, transaction_id: str, prepared_key: str, aborted_key: str) -> tuple[bool, str]:
+    lock_key = f"lock:user:{user_id}"
+    try:
+        with db.pipeline() as pipe:
+            pipe.multi()
+            pipe.set(aborted_key, "1", ex=IDEMPOTENCY_TTL)
+            pipe.delete(prepared_key)
+            pipe.execute()
+    except redis.exceptions.RedisError:
+        return False, "DB error"
+
+    try:
+        lock_owner = db.get(lock_key)
+        if lock_owner and lock_owner.decode("utf-8") == transaction_id:
+            db.delete(lock_key)
+    except redis.exceptions.RedisError:
+        return False, "DB error"
+    return True, ""
+
+
 def _handle_command(command: dict) -> None:
     message_id = command.get("message_id")
     if not message_id:
@@ -285,6 +396,107 @@ def _handle_command(command: dict) -> None:
     saga_id = command.get("saga_id") or order_id
     user_id = command.get("user_id")
     amount = command.get("amount")
+    transaction_id = command.get("transaction_id")
+    attempt_id = command.get("attempt_id", "")
+
+    # ── PreparePayment (2PC) ─────────────────────────────────────────────
+    if command_type == "PreparePayment":
+        if _message_processed(message_id):
+            return
+        if not order_id or not transaction_id or user_id is None or amount is None:
+            return
+
+        prepared_key = f"{PAYMENT_2PC_PREPARED_PREFIX}{transaction_id}"
+        committed_key = f"{PAYMENT_2PC_COMMITTED_PREFIX}{transaction_id}"
+        try:
+            if db.exists(committed_key):
+                ok, reason = True, "Already committed"
+            elif db.exists(prepared_key):
+                ok, reason = True, "Already prepared"
+            else:
+                ok, reason = _prepare_payment_2pc(user_id, int(amount), transaction_id, prepared_key)
+        except redis.exceptions.RedisError:
+            ok, reason = False, "DB error"
+
+        event = {
+            "message_id": str(uuid.uuid4()),
+            "type": "PreparePaymentResult",
+            "order_id": order_id,
+            "transaction_id": transaction_id,
+            "attempt_id": attempt_id,
+            "success": ok,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if send_event(event):
+            _mark_message_processed(message_id)
+        return
+
+    # ── CommitPayment (2PC) ──────────────────────────────────────────────
+    if command_type == "CommitPayment":
+        if _message_processed(message_id):
+            return
+        if not order_id or not transaction_id or user_id is None or amount is None:
+            return
+
+        prepared_key = f"{PAYMENT_2PC_PREPARED_PREFIX}{transaction_id}"
+        committed_key = f"{PAYMENT_2PC_COMMITTED_PREFIX}{transaction_id}"
+        try:
+            if db.exists(committed_key):
+                ok, reason = True, "Already committed"
+            elif not db.exists(prepared_key):
+                ok, reason = True, "No reservation"
+            else:
+                ok, reason = _commit_payment_2pc(user_id, int(amount), transaction_id, prepared_key, committed_key)
+        except redis.exceptions.RedisError:
+            ok, reason = False, "DB error"
+
+        event = {
+            "message_id": str(uuid.uuid4()),
+            "type": "CommitPaymentResult",
+            "order_id": order_id,
+            "transaction_id": transaction_id,
+            "attempt_id": attempt_id,
+            "success": ok,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if send_event(event):
+            _mark_message_processed(message_id)
+        return
+
+    # ── AbortPayment (2PC) ───────────────────────────────────────────────
+    if command_type == "AbortPayment":
+        if _message_processed(message_id):
+            return
+        if not order_id or not transaction_id or user_id is None:
+            return
+
+        prepared_key = f"{PAYMENT_2PC_PREPARED_PREFIX}{transaction_id}"
+        aborted_key = f"{PAYMENT_2PC_ABORTED_PREFIX}{transaction_id}"
+        try:
+            if db.exists(aborted_key):
+                ok, reason = True, "Already aborted"
+            elif not db.exists(prepared_key):
+                ok, reason = True, "No reservation"
+            else:
+                ok, reason = _abort_payment_2pc(user_id, transaction_id, prepared_key, aborted_key)
+        except redis.exceptions.RedisError:
+            ok, reason = False, "DB error"
+
+        event = {
+            "message_id": str(uuid.uuid4()),
+            "type": "AbortPaymentResult",
+            "order_id": order_id,
+            "transaction_id": transaction_id,
+            "attempt_id": attempt_id,
+            "success": ok,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if send_event(event):
+            _mark_message_processed(message_id)
+        return
 
     # ── ChargePayment ────────────────────────────────────────────────────
     if command_type == "ChargePayment":
@@ -428,6 +640,97 @@ def start_background_services() -> None:
             return
         _start_command_consumer()
         _background_services_started = True
+
+# 2PC functions for Payment App
+
+# Prepare phase - Acquire lock and verify credit
+@app.post('/prepare/pay/<user_id>/<amount>/<transaction_id>')
+def prepare_pay(user_id: str, amount: int, transaction_id: str):
+    app.logger(f"Prepare phase for Payment Service {user_id}")
+
+    lock_key = f"lock:user:{user_id}"
+    lock_value = transaction_id
+
+    # Try to acquire lock
+    locked = db.set(lock_key, lock_value, nx=True, ex=300) # Expire after 5 mins
+    if not locked:
+        return Response(f"User account locked by another transaction", status=409)
+
+    # Now that we have the lock, we check for credit
+    try:
+        user_entry: UserValue = get_user_from_db(user_id)
+    except:
+        db.delete(lock_key)
+        raise
+
+    # check if sufficient amount is present
+    if user_entry.credit < amount:
+        return Response(f"Insufficient credit for user {user_id}")
+    
+    # Store the payment reservation with lock held
+    reservation_key = f"payment_reservation:{transaction_id}"
+    reservation_data = msgpack.encode({"user_id": user_id, "amount": int(amount)})
+    try:
+        db.setex(reservation_key, 300, reservation_data)  # 5 min TTL
+    except redis.exceptions.RedisError:
+        db.delete(lock_key)  # Release lock on error
+        return abort(400, DB_ERROR_STR)
+    
+    app.logger.debug(f"Payment prepared for user {user_id}, transaction {transaction_id}")
+    return Response("PREPARED", status=200)
+
+# COMMIT phase - Deduct credit and release lock
+@app.post('/commit/pay/<transaction_id>')
+def commit_pay(transaction_id: str):
+    reservation_key = f"payment_reservation:{transaction_id}"
+    reservation_data = db.get(reservation_key)
+    
+    if not reservation_data:
+        return abort(400, "Transaction not found")
+    
+    data = msgpack.decode(reservation_data, type=dict)
+    user_id = data["user_id"]
+    amount = data["amount"]
+    
+    # Perform the actual credit deduction
+    user_entry: UserValue = get_user_from_db(user_id)
+    user_entry.credit -= amount
+    
+    try:
+        db.set(user_id, msgpack.encode(user_entry))
+        db.delete(reservation_key)
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    
+    # Release the lock
+    lock_key = f"lock:user:{user_id}"
+    db.delete(lock_key)
+    
+    app.logger.debug(f"Payment committed for user {user_id}, transaction {transaction_id}")
+    return Response("COMMITTED", status=200)
+
+# ABORT phase - Release reservation and lock
+@app.post('/abort/pay/<transaction_id>')
+def abort_pay(transaction_id: str):
+    reservation_key = f"payment_reservation:{transaction_id}"
+    reservation_data = db.get(reservation_key)
+    
+    if reservation_data:
+        data = msgpack.decode(reservation_data, type=dict)
+        user_id = data["user_id"]
+        
+        # Release lock
+        lock_key = f"lock:user:{user_id}"
+        # Only delete if this transaction owns the lock
+        lock_owner = db.get(lock_key)
+        if lock_owner and lock_owner.decode() == transaction_id:
+            db.delete(lock_key)
+        
+        db.delete(reservation_key)
+    
+    app.logger.debug(f"Payment aborted for transaction {transaction_id}")
+    return Response("ABORTED", status=200)
+
 
 
 if __name__ == '__main__':
