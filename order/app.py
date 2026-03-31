@@ -5,6 +5,7 @@ import json
 import random
 import threading
 import time
+import requests
 import uuid
 from collections import defaultdict
 
@@ -42,6 +43,8 @@ STOCK_COMMAND_TOPIC = os.environ.get("STOCK_COMMAND_TOPIC", "stock-commands")   
 STOCK_EVENT_TOPIC = os.environ.get("STOCK_EVENT_TOPIC", "stock-events")          # stock out-queue → in-queue
 PAYMENT_COMMAND_TOPIC = os.environ.get("PAYMENT_COMMAND_TOPIC", "payment-commands")  # out-queue → payment in-queue
 PAYMENT_EVENT_TOPIC = os.environ.get("PAYMENT_EVENT_TOPIC", "payment-events")        # payment out-queue → in-queue
+
+ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://orchestrator:8000")
 
 TRANSACTION_MODE = os.environ.get("TRANSACTION_MODE", "saga").lower()
 if (TRANSACTION_MODE == "saga" or TRANSACTION_MODE == "2pc") and not KAFKA_AVAILABLE :
@@ -1600,8 +1603,8 @@ def checkout(order_id: str):
     # Determine Checkout Mode
     if TRANSACTION_MODE == "2pc":
         return checkout_2pc(order_id)
-    
-    # Handle empty items list in checkout
+
+    # Handle empty items list locally
     order_entry = get_order_from_db(order_id)
     if not order_entry.items:
         if order_entry.paid:
@@ -1613,56 +1616,22 @@ def checkout(order_id: str):
             return abort(400, DB_ERROR_STR)
         return Response("Checkout successful", status=200)
 
-    started, reason = _start_saga(order_id)
-    if not started:
-        if reason == "Order already paid":
-            return Response("Order already paid", status=200)
-        return abort(400, reason)
+    try:  # need to change this to be persistent across retries and all that, this sucks
+        orch_resp = requests.post(
+            f"{ORCHESTRATOR_URL}/transactions",
+            json={"order_id": order_id},
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        return abort(400, f"Orchestrator unavailable: {e}")
 
-    ok, reason = _wait_for_saga(order_id)
+    if orch_resp.status_code == 200:
+        return Response(orch_resp.text, status=200)
 
-    # Only release lock if saga reached terminal state
-    state = get_saga_state(order_id)
-    if state and state.get("status") in ("completed", "failed"):
-        _release_saga_lock(order_id, state.get("lock_token"))
-    
-    if ok:
-        return Response("Checkout successful", status=200)
+    if orch_resp.status_code == 400 and "Order already paid" in orch_resp.text:
+        return Response("Order already paid", status=200)
 
-    if state and state.get("status") not in ("completed", "failed"):
-        step = state.get("step")
-
-        if step == "reserve_stock":
-            _transition_to_rollback_stock(
-                order_id,
-                state,
-                reason or "Checkout timed out",
-            )
-
-        elif step == "charge_payment":
-            # We have reserved stock, payment may be in air or suc without notification, regardless rollback
-            _transition_to_rollback_payment(
-                order_id,
-                state,
-                reason or "Checkout timed out",
-            )
-
-        elif step == "rollback_payment":
-            # Already compensating
-            pass
-
-        elif step == "rollback_stock":
-            # Already compensating
-            pass
-
-        else:
-            _finish_saga_failed(
-                order_id,
-                state,
-                reason or "Checkout timed out",
-            )
-                
-    return abort(400, reason)
+    return abort(400, orch_resp.text)
 
 
 _background_services_started = False

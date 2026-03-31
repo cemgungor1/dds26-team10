@@ -3,7 +3,7 @@ import os
 import threading
 import saga
 import redis
-import two_pc
+import tpc
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response, request
@@ -47,7 +47,7 @@ def start_transaction():
     if protocol == "saga":
         return saga.start_transaction(body)
     elif protocol == "2pc":
-        return two_pc.start_transaction(body)
+        return tpc.start_transaction(body)
     else:
         abort(400, "Unsupported protocol")
 
