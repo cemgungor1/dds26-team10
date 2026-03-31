@@ -8,6 +8,10 @@ version: "3"
 # Usage: docker compose -f docker-compose.yml -f docker-compose.medium.yml up -d
 # Large configuration: 5 instances each
 # Usage: docker compose -f docker-compose.yml -f docker-compose.large.yml up -d
+# XLarge configuration: 10 instances each
+# Usage: docker compose -f docker-compose.yml -f docker-compose.xlarge.yml up -d
+# XXLarge configuration: 20 instances each
+# Usage: docker compose -f docker-compose.yml -f docker-compose.xxlarge.yml up -d
 services:
 
   gateway:
