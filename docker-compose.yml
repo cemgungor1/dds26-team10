@@ -31,7 +31,28 @@ services:
       - env/order_redis.env
     depends_on:
       - order-db
+      - orchestrator
+
+  orchestrator:
+    build: ./orchestrator
+    image: orchestrator:latest
+    restart: always
+    command: gunicorn -b 0.0.0.0:8001 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - STOCK_EVENT_TOPIC=stock-events
+      - PAYMENT_EVENT_TOPIC=payment-events
+      - TX_TIMEOUT_SECONDS=10
+      - RECOVERY_INTERVAL=5
+      - STALE_THRESHOLD=8
+      - REDIS_HOST=order-db
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=1
+    depends_on:
+      - order-db
       - kafka
+
 
   order-db:
     image: redis:7.2-bookworm
