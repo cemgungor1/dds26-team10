@@ -1,5 +1,7 @@
 import logging
 import os
+import time
+import json
 import threading
 import saga
 import redis
@@ -78,12 +80,66 @@ def start_background_services() -> None:
         _background_services_started = True
 
 
+def _handle_event(event: dict) -> None:
+    if tpc.handle_event(event):
+        return
+    if saga.handle_event(event):
+        return
+
+def _event_consumer_loop() -> None:
+    if not KAFKA_AVAILABLE:
+        return
+
+    while True:
+        try:
+            consumer = KafkaConsumer(
+                saga.STOCK_EVENT_TOPIC,
+                saga.PAYMENT_EVENT_TOPIC,
+                bootstrap_servers=saga.KAFKA_BROKERS.split(","),
+                value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+                key_deserializer=lambda v: v.decode("utf-8") if v else None,
+                group_id="orchestrator-events",
+                auto_offset_reset="earliest",
+                enable_auto_commit=False,
+            )
+            for message in consumer:
+                try:
+                    _handle_event(message.value)
+                    consumer.commit()
+                except Exception:
+                    app.logger.exception("Failed to handle orchestrator event")
+        except NoBrokersAvailable:
+            app.logger.warning("Kafka unavailable for orchestrator event consumer; retrying in 1s")
+            time.sleep(1.0)
+        except Exception:
+            app.logger.exception("Orchestrator event consumer failed; retrying in 1s")
+            time.sleep(1.0)
+
+def _start_event_consumer() -> None:
+    if not KAFKA_AVAILABLE:
+        return
+    thread = threading.Thread(target=_event_consumer_loop, daemon=True)
+    thread.start()
+
+def start_background_services() -> None:
+    global _background_services_started
+
+    if not KAFKA_AVAILABLE:
+        return
+
+    with _background_services_lock:
+        if _background_services_started:
+            return
+
+        _start_event_consumer()
+        saga.start_recovery_worker()
+        _background_services_started = True
+
+
 if __name__ == '__main__':
     start_background_services()
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    start_background_services()
-
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)

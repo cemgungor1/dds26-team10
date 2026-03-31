@@ -832,8 +832,7 @@ def _handle_stock_rolled_back(saga_id: str, state: dict, event: dict) -> None:
         state.get("reason", "Compensated and failed"),
     )
 
-def _handle_event(event: dict) -> None:
-
+def handle_event(event: dict) -> None:
     event_type = event.get("type")
     saga_id = event.get("saga_id") or event.get("order_id")
     if not saga_id:
@@ -1096,8 +1095,7 @@ def checkout(order_id: str):
                 
     return abort(400, reason)
 
-def start_background_workers() -> None:
-    _start_event_consumer()
+def start_recovery_worker() -> None:
     _start_saga_recovery()
 
 def start_transaction(body):
