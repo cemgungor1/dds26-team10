@@ -25,6 +25,8 @@ except Exception as e:
 
 app = Flask("orchestrator")
 
+TPC_PROTOCOL = os.getenv("TPC_PROTOCOL", "false").lower() == "true"
+
 db: redis.Redis = redis.Redis(
     host=os.environ['REDIS_HOST'],
     port=int(os.environ['REDIS_PORT']),
@@ -45,6 +47,9 @@ class OrderValue(Struct):
 def start_transaction():
     body = request.get_json(force=True)
     protocol = body.get("protocol", "saga")
+
+    requested_protocol = body.get("protocol", "saga")
+    protocol = "2pc" if TPC_PROTOCOL else requested_protocol
 
     if protocol == "saga":
         return saga.start_transaction(body)

@@ -19,7 +19,6 @@ services:
     restart: always
     environment:
       - ORCHESTRATOR_URL=http://orchestrator:8001
-      - CHECKOUT_METHOD=2PC
       - STOCK_GRPC_HOST=stock-service
       - STOCK_GRPC_PORT=50051
       - PAYMENT_GRPC_HOST=payment-service
@@ -41,6 +40,7 @@ services:
     restart: always
     command: gunicorn -b 0.0.0.0:8001 -w 2 --timeout 30 --log-level=info app:app
     environment:
+      - TPC_PROTOCOL=false
       - KAFKA_BROKERS=kafka:29092
       - STOCK_EVENT_TOPIC=stock-events
       - PAYMENT_EVENT_TOPIC=payment-events
