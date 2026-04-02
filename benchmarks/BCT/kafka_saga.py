@@ -314,7 +314,7 @@ class TestKafkaConsumerGroups(unittest.TestCase):
         producer.flush()
         producer.close()
 
-        time.sleep(0.5)  # let broker settle
+        time.sleep(20)  # let broker settle
 
         consumer = _make_consumer(topic)  # always uses earliest + new group
         messages = _drain(consumer, max_messages=4)

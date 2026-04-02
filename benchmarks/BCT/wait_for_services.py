@@ -20,7 +20,7 @@ def wait_for(url: str, timeout: int) -> bool:
                 return True
         except requests.RequestException:
             pass
-        time.sleep(1)
+        time.sleep(20)
     return False
 
 
@@ -31,7 +31,7 @@ def main() -> int:
             print(f"Timed out waiting for {url}")
             return 1
         print(f"Ready: {url}")
-    time.sleep(10) # kafka wait hacky oops
+    time.sleep(20) # kafka wait hacky oops
     return 0
 
 

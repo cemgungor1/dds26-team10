@@ -11,7 +11,7 @@ COMPOSE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."
 
 PAYMENT_URL = "http://127.0.0.1:8000"
 
-ROLLBACK_TIMEOUT = 15 # seconds to wait for async
+ROLLBACK_TIMEOUT = 20 # seconds to wait for async
 class TestRollback(unittest.TestCase):
     
     def _wait_for_rollback(self, seconds: int = ROLLBACK_TIMEOUT):
@@ -23,7 +23,7 @@ class TestRollback(unittest.TestCase):
             cwd=COMPOSE_DIR,
             check=True,
         )
-        time.sleep(5)
+        time.sleep(20)
  
     def _start_service(self, service: str):
         subprocess.run(
@@ -31,7 +31,7 @@ class TestRollback(unittest.TestCase):
             cwd=COMPOSE_DIR,
             check=True,
         )
-        time.sleep(5)
+        time.sleep(20)
  
     def test_success_commits_all_resources(self):
         # Basic SAGA checkout (baseline)

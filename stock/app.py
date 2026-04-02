@@ -690,36 +690,33 @@ def prepare_subtract(item_id: str, amount: int, transaction_id: str):
     app.logger.debug(f"Stock prepared for item {item_id}, transaction {transaction_id}")
     return Response("PREPARED", status=200)
 
-
-# COMMIT phase - Subtract stock and release locks
 @app.post('/commit/subtract/<transaction_id>')
 def commit_subtract(transaction_id: str):
-    # Find all reservations for this transaction
     pattern = f"stock_reservation:{transaction_id}:*"
     keys = db.keys(pattern)
-    
     for key in keys:
         item_id = key.decode().split(":")[-1]
         amount = int(db.get(key))
-        
-        # Perform the actual stock subtraction
-        item_entry: StockValue = get_item_from_db(item_id)
-        item_entry.stock -= amount
-        
-        try:
-            db.set(item_id, msgpack.encode(item_entry))
-            db.delete(key)  # Remove reservation
-        except redis.exceptions.RedisError:
+        for _attempt in range(20):
+            try:
+                with db.pipeline() as pipe:
+                    pipe.watch(item_id)
+                    raw = pipe.get(item_id)
+                    if not raw:
+                        abort(400, f"Item: {item_id} not found!")
+                    item_entry = msgpack.decode(raw, type=StockValue)
+                    item_entry.stock -= amount
+                    pipe.multi()
+                    pipe.set(item_id, msgpack.encode(item_entry))
+                    pipe.delete(key)
+                    pipe.delete(f"lock:item:{item_id}")
+                    pipe.execute()
+                    break
+            except redis.exceptions.WatchError:
+                continue
+        else:
             return abort(400, DB_ERROR_STR)
-        
-        # Release the lock
-        lock_key = f"lock:item:{item_id}"
-        db.delete(lock_key)
-        
-        app.logger.debug(f"Stock committed for item {item_id}, new stock: {item_entry.stock}")
-    
     return Response("COMMITTED", status=200)
-
 
 # ABORT phase - Release reservations and locks
 @app.post('/abort/subtract/<transaction_id>')
@@ -748,3 +745,4 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+    start_background_services() 

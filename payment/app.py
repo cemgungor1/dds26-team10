@@ -647,7 +647,7 @@ def start_background_services() -> None:
 # Prepare phase - Acquire lock and verify credit
 @app.post('/prepare/pay/<user_id>/<amount>/<transaction_id>')
 def prepare_pay(user_id: str, amount: int, transaction_id: str):
-    app.logger(f"Prepare phase for Payment Service {user_id}")
+    app.logger.debug(f"Prepare phase for Payment Service {user_id}")
 
     lock_key = f"lock:user:{user_id}"
     lock_value = transaction_id
@@ -666,11 +666,12 @@ def prepare_pay(user_id: str, amount: int, transaction_id: str):
 
     # check if sufficient amount is present
     if user_entry.credit < amount:
-        return Response(f"Insufficient credit for user {user_id}")
+        db.delete(lock_key)
+        return Response(f"Insufficient credit for user {user_id}", status=400)
     
     # Store the payment reservation with lock held
     reservation_key = f"payment_reservation:{transaction_id}"
-    reservation_data = msgpack.encode({"user_id": user_id, "amount": int(amount)})
+    reservation_data = json.dumps({"user_id": user_id, "amount": int(amount)})
     try:
         db.setex(reservation_key, 300, reservation_data)  # 5 min TTL
     except redis.exceptions.RedisError:
@@ -689,7 +690,7 @@ def commit_pay(transaction_id: str):
     if not reservation_data:
         return abort(400, "Transaction not found")
     
-    data = msgpack.decode(reservation_data, type=dict)
+    data = json.loads(reservation_data)
     user_id = data["user_id"]
     amount = data["amount"]
     
@@ -717,7 +718,7 @@ def abort_pay(transaction_id: str):
     reservation_data = db.get(reservation_key)
     
     if reservation_data:
-        data = msgpack.decode(reservation_data, type=dict)
+        data = json.loads(reservation_data)
         user_id = data["user_id"]
         
         # Release lock
@@ -739,3 +740,4 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+    start_background_services() 

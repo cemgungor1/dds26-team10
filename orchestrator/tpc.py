@@ -59,6 +59,11 @@ TPC_STATE_PREFIX = "tpc:state:"
 TPC_LOCK_PREFIX = "tpc:lock:"
 TPC_NOTIFY_PREFIX = "tpc:notify:"
 
+# Add near the top of tpc.py, with the other constants:
+SAGA_LOG_PREFIX = "saga:log:"
+SAGA_STATE_PREFIX = "saga:state:"
+SAGA_LOCK_PREFIX = "saga:lock:"
+
 db: redis.Redis = redis.Redis(
     host=os.environ['REDIS_HOST'],
     port=int(os.environ['REDIS_PORT']),
@@ -314,10 +319,11 @@ def _send_with_retry(topic: str, command: dict, max_retries: int = 3) -> bool:
 
 
 def _start_event_consumer() -> None:
-    if not KAFKA_AVAILABLE:
-        return
-    thread = threading.Thread(target=_event_consumer_loop, daemon=True)
-    thread.start()
+    #if not KAFKA_AVAILABLE:
+    #    return
+    #thread = threading.Thread(target=_event_consumer_loop, daemon=True)
+    #thread.start()
+    pass
 
 
 # ─── Saga Recovery Thread ────────────────────────────────────────────────────

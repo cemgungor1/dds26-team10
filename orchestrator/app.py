@@ -76,6 +76,8 @@ def start_background_services() -> None:
         if _background_services_started:
             return
 
+        _start_event_consumer()
+        saga.start_recovery_worker()
         saga.start_background_workers()
         _background_services_started = True
 
@@ -120,20 +122,6 @@ def _start_event_consumer() -> None:
         return
     thread = threading.Thread(target=_event_consumer_loop, daemon=True)
     thread.start()
-
-def start_background_services() -> None:
-    global _background_services_started
-
-    if not KAFKA_AVAILABLE:
-        return
-
-    with _background_services_lock:
-        if _background_services_started:
-            return
-
-        _start_event_consumer()
-        saga.start_recovery_worker()
-        _background_services_started = True
 
 
 if __name__ == '__main__':

@@ -21,7 +21,7 @@ class TestCoordinatorFailure(unittest.TestCase):
             cwd=COMPOSE_DIR, 
             check=True
         )
-        time.sleep(5)
+        time.sleep(20)
 
     def _start_order_service(self):
         subprocess.run(
@@ -29,7 +29,7 @@ class TestCoordinatorFailure(unittest.TestCase):
             cwd=COMPOSE_DIR, 
             check=True
         )
-        time.sleep(5)  
+        time.sleep(20)  
 
     def test_crash_before_commit_point(self):
         # Create item
