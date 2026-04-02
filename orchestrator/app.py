@@ -83,7 +83,6 @@ def start_background_services() -> None:
 
         _start_event_consumer()
         saga.start_recovery_worker()
-        saga.start_background_workers()
         _background_services_started = True
 
 
