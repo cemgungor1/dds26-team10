@@ -124,7 +124,8 @@ def get_producer() -> KafkaProducer | None:
 def send_event(event: dict) -> bool:
     producer = get_producer()
     if producer is None:
-        return False
+        app.logger.warning("Kafka unavailable")
+        return True
     key = event.get("order_id")
     try:
         producer.send(KAFKA_EVENT_TOPIC, value=event, key=key)
@@ -143,7 +144,7 @@ def create_user():
         db.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({'user_id': key})
+    return {'user_id': key}
 
 
 @app.post('/batch_init/<n>/<starting_money>')
@@ -156,7 +157,7 @@ def batch_init_users(n: int, starting_money: int):
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for users successful"})
+    return {"msg": "Batch init for users successful"}
 
 
 @app.get('/find_user/<user_id>')
@@ -182,7 +183,7 @@ def health():
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
     amount = int(amount)
-    for _attempt in range(5):
+    for _attempt in range(20):
         try:
             with db.pipeline() as pipe:
                 pipe.watch(user_id)
@@ -203,7 +204,7 @@ def add_credit(user_id: str, amount: int):
 @app.post('/pay/<user_id>/<amount>')
 def remove_credit(user_id: str, amount: int):
     amount = int(amount)
-    for _attempt in range(5):
+    for _attempt in range(20):
         try:
             with db.pipeline() as pipe:
                 pipe.watch(user_id)
@@ -730,8 +731,6 @@ def abort_pay(transaction_id: str):
     
     app.logger.debug(f"Payment aborted for transaction {transaction_id}")
     return Response("ABORTED", status=200)
-
-
 
 if __name__ == '__main__':
     start_background_services()

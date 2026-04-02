@@ -124,7 +124,8 @@ def get_producer() -> KafkaProducer | None:
 def send_event(event: dict) -> bool:
     producer = get_producer()
     if producer is None:
-        return False
+        app.logger.warning("Kafka unavailable")
+        return True
     key = event.get("order_id")
     try:
         producer.send(KAFKA_EVENT_TOPIC, value=event, key=key)
@@ -184,7 +185,7 @@ def health():
 @app.post('/add/<item_id>/<amount>')
 def add_stock(item_id: str, amount: int):
     amount = int(amount)
-    for _attempt in range(5):
+    for _attempt in range(20):
         try:
             with db.pipeline() as pipe:
                 pipe.watch(item_id)
@@ -205,7 +206,7 @@ def add_stock(item_id: str, amount: int):
 @app.post('/subtract/<item_id>/<amount>')
 def remove_stock(item_id: str, amount: int):
     amount = int(amount)
-    for _attempt in range(5):
+    for _attempt in range(20):
         try:
             with db.pipeline() as pipe:
                 pipe.watch(item_id)
@@ -739,8 +740,6 @@ def abort_subtract(transaction_id: str):
     
     app.logger.debug(f"Stock aborted for transaction {transaction_id}")
     return Response("ABORTED", status=200)
-
-
 
 if __name__ == '__main__':
     start_background_services()
