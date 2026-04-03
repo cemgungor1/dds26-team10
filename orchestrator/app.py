@@ -52,8 +52,10 @@ def start_transaction():
     protocol = "2pc" if TPC_PROTOCOL else requested_protocol
 
     if protocol == "saga":
+        app.logger.info("Using SAGA protocol")
         return saga.start_transaction(body)
     elif protocol == "2pc":
+        app.logger.info("Using TPC protocol")
         return tpc.start_transaction(body)
     else:
         abort(400, "Unsupported protocol")
