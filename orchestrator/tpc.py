@@ -475,14 +475,34 @@ def _handle_tpc_decision_ack(state: dict, event: dict) -> None:
 
     if decision == "abort":
         if event_type == "AbortStockResult":
-            state["acks"]["stock"] = success
+            state["acks"]["stock"] = True
         elif event_type == "AbortPaymentResult":
-            state["acks"]["payment"] = success
+            state["acks"]["payment"] = True
+        elif event_type in ("CommitStockResult", "CommitPaymentResult"):
+            # A late commit-result arrived after we already decided to abort
+            # (e.g. the coordinator forced an abort on timeout while a commit
+            # command was still in-flight).  Treat the slot as acked so the
+            # abort can complete; the participant honours the subsequent
+            # AbortXxx command via its idempotency key.
+            logger.warning(
+                "TPC %s: received %s while decision=abort; treating as abort ack",
+                state["transaction_id"], event_type,
+            )
+            if event_type == "CommitStockResult":
+                state["acks"]["stock"] = True
+            else:
+                state["acks"]["payment"] = True
         else:
             return
         _persist_tpc_state(order_id, state)
+        reason = state.get("reason", "2PC aborted")
+        timed_out = "not respond" in reason or "timed out" in reason.lower()
         if state["acks"]["stock"] and state["acks"]["payment"]:
-            _finish_tpc(order_id, state, False, state.get("reason", "2PC aborted"))
+            _finish_tpc(order_id, state, False, reason)
+        elif timed_out and (state["acks"]["stock"] or state["acks"]["payment"]):
+            # Abort was forced because one participant was down; we will never
+            # receive its ack.  Finish now rather than waiting forever.
+            _finish_tpc(order_id, state, False, reason)
 
 
 def _handle_tpc_event(event: dict) -> bool:
@@ -542,6 +562,26 @@ def _wait_for_tpc(order_id: str) -> tuple[bool, str]:
 def _recover_tpc(order_id: str, state: dict) -> None:
     step = state.get("step")
     if step == "wait_prepare":
+        stock_vote = state["votes"].get("stock")
+        payment_vote = state["votes"].get("payment")
+        # If at least one vote has already arrived but the other service is
+        # silent (down), we must abort rather than re-send prepare forever.
+        # A missing vote counts as NO: abort both participants so that any
+        # resource locked by the responding participant is released.
+        if stock_vote is not None or payment_vote is not None:
+            logger.info(
+                "TPC %s: stuck in wait_prepare with partial votes "
+                "(stock=%s, payment=%s); forcing abort",
+                state["transaction_id"], stock_vote, payment_vote,
+            )
+            state["decision"] = "abort"
+            state["step"] = "wait_abort_ack"
+            state["status"] = "aborting"
+            state["reason"] = "Participant did not respond in time"
+            _persist_tpc_state(order_id, state)
+            _tpc_send_decision_commands(order_id, state)
+            return
+        # No votes at all yet — re-send both prepare commands.
         stock_prepare = {
             "message_id": str(uuid.uuid4()), "type": "PrepareStock",
             "order_id": order_id, "transaction_id": state["transaction_id"],
@@ -666,6 +706,25 @@ def checkout_kafka_2pc(order_id: str) -> Response:
     ok, reason = _wait_for_tpc(order_id)
     if ok:
         return Response("Checkout successful", status=200)
+
+    # On timeout the transaction may still be in a non-terminal state.
+    # Drive it to abort so that any resources locked during prepare are
+    # released, mirroring the compensation logic in saga.py checkout().
+    tpc_state = _decode_json_value(db.get(_tpc_state_key(order_id)))
+    if tpc_state and tpc_state.get("status") not in ("completed", "failed"):
+        step = tpc_state.get("step")
+        if step in ("wait_prepare", "wait_abort_ack"):
+            # Force an abort decision and send AbortStock + AbortPayment so
+            # that any participant that already locked resources will release.
+            tpc_state["decision"] = "abort"
+            tpc_state["step"] = "wait_abort_ack"
+            tpc_state["status"] = "aborting"
+            tpc_state["reason"] = reason or "Checkout timed out"
+            _persist_tpc_state(order_id, tpc_state)
+            _tpc_send_decision_commands(order_id, tpc_state)
+        # wait_commit_ack: commit is already in-flight; let the recovery
+        # loop re-drive it rather than converting it to an abort.
+
     abort(400, reason)
 
 def handle_event(event: dict) -> bool:
