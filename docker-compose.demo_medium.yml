@@ -1,0 +1,26 @@
+version: "3"
+# Demo medium configuration: 50 total containers
+# Fixed infrastructure (6): gateway=1, order-db=1, stock-db=1, payment-db=1, zookeeper=1, kafka=1
+# Scaled services (44): evenly split as order-service=11, stock-service=11, orchestrator=11, payment-service=11
+# Usage: docker compose -f docker-compose.yml -f docker-compose.demo_medium.yml up -d
+
+services:
+  order-service:
+    deploy:
+      mode: replicated
+      replicas: 11
+
+  stock-service:
+    deploy:
+      mode: replicated
+      replicas: 11
+
+  payment-service:
+    deploy:
+      mode: replicated
+      replicas: 11
+
+  orchestrator:
+    deploy:
+      mode: replicated
+      replicas: 11
