@@ -2,3 +2,9 @@
 .DS_Store
 __pycache__/
 run.sh
+
+benchmarks/BCT/__pycache__/*
+benchmarks/BSCT/consistency-test/__pycache__/*
+benchmarks/BSCT/stress-test/__pycache__/*
+test/__pycache__/*
+order/__pycache__/*
