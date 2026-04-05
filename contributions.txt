@@ -6,7 +6,11 @@ Darwin Morris, 4916344, D.B.Morris-1@student.tudelft.nl:
 
 Cenker, , , :
 
-Cem, , , :
+Cem Gungor, 6500617, C.Gungor@student.tudelft.nl:
+  - Helped implement redis sentinels for highly available redis
+  - Helped implementing Saga without the orchestrator
+  - Tried rewriting orchestrator and order with queues and tested several approaches
+  - Assisted in debugging, testing
 
 Dyujoy, 6497462, dyujoymajumdar@tudelft.nl:
   - Helped in implementing the Two Phase Commit in the first phase
