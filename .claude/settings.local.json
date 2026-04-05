@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose:*)",
+      "Bash(curl -s http://localhost:8000/orders/health)",
+      "Bash(curl -s http://localhost:8000/stock/health)",
+      "Bash(curl -s http://localhost:8000/payment/health)",
+      "Bash(python run_tests.py)"
+    ]
+  }
+}

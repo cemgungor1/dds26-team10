@@ -12,9 +12,10 @@ import redis
 import grpc
 import services_pb2
 from grpc_clients import stock_stub, payment_stub
+from sharded_redis import create_sharded_redis
 
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from flask import Flask, jsonify, abort, Response, request
 
 try:
     from kafka import KafkaProducer, KafkaConsumer
@@ -55,11 +56,16 @@ SAGA_NOTIFY_TTL = 60
 
 app = Flask("order-service")
 
-db: redis.Redis = redis.Redis(
-    host=os.environ['REDIS_HOST'],
-    port=int(os.environ['REDIS_PORT']),
-    password=os.environ['REDIS_PASSWORD'],
-    db=int(os.environ['REDIS_DB']))
+
+def service_route(prefix: str, rule: str, **options):
+    """Register both direct service routes and gateway-style prefixed aliases."""
+    def decorator(func):
+        app.route(rule, **options)(func)
+        app.route(f"/{prefix}{rule}", **options)(func)
+        return func
+    return decorator
+
+db = create_sharded_redis()
 
 
 def close_db_connection():
@@ -296,7 +302,7 @@ def send_to_topic(topic: str, message: dict) -> bool:
 
 # ─── REST Endpoints ──────────────────────────────────────────────────────────
 
-@app.post('/create/<user_id>')
+@service_route("orders", "/create/<user_id>", methods=["POST"])
 def create_order(user_id: str):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
@@ -308,12 +314,13 @@ def create_order(user_id: str):
 
 
 # This endpoint is for testing/demo purposes: it creates n orders with random items and users.
-@app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
+@service_route("orders", "/batch_init/<n>/<n_items>/<n_users>/<item_price>", methods=["POST"])
 def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     n = int(n)
     n_items = int(n_items)
     n_users = int(n_users)
     item_price = int(item_price)
+    start_id = request.args.get("start_id", default=0, type=int)
 
     def generate_entry() -> OrderValue:
         user_id = random.randint(0, n_users - 1)
@@ -326,15 +333,19 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
             total_cost=2 * item_price,
         )
 
-    kv_pairs = {f"{i}": msgpack.encode(generate_entry()) for i in range(n)}
+    kv_pairs = {f"{start_id + i}": msgpack.encode(generate_entry()) for i in range(n)}
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for orders successful"})
+    return jsonify({
+        "msg": "Batch init for orders successful",
+        "start_id": start_id,
+        "count": n,
+    })
 
 
-@app.get('/find/<order_id>')
+@service_route("orders", "/find/<order_id>", methods=["GET"])
 def find_order(order_id: str):
     order_entry: OrderValue = get_order_from_db(order_id)
     return jsonify(
@@ -348,7 +359,7 @@ def find_order(order_id: str):
     )
 
 
-@app.get('/health')
+@service_route("orders", "/health", methods=["GET"])
 def health():
     '''Health check endpoint to verify Redis connectivity.'''
     try:
@@ -358,7 +369,7 @@ def health():
     return Response("OK", status=200)
 
 
-@app.post('/addItem/<order_id>/<item_id>/<quantity>')
+@service_route("orders", "/addItem/<order_id>/<item_id>/<quantity>", methods=["POST"])
 def add_item(order_id: str, item_id: str, quantity: int):
     quantity = int(quantity)
     try:
@@ -1130,7 +1141,7 @@ def _start_saga_recovery() -> None:
 
 # ─── Checkout Endpoint ───────────────────────────────────────────────────────
 
-@app.post('/checkout/<order_id>')
+@service_route("orders", "/checkout/<order_id>", methods=["POST"])
 def checkout(order_id: str):
     # Sync fallback when Kafka is unavailable
     if TRANSACTION_MODE == "sync":

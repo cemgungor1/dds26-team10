@@ -9,7 +9,8 @@ import uuid
 import redis
 
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from flask import Flask, jsonify, abort, Response, request
+from sharded_redis import create_sharded_redis
 try:
     from kafka import KafkaProducer, KafkaConsumer
     from kafka.errors import KafkaError, NoBrokersAvailable
@@ -37,10 +38,16 @@ IDEMPOTENCY_TTL = int(os.environ.get("IDEMPOTENCY_TTL", "3600"))
 
 app = Flask("stock-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+
+def service_route(prefix: str, rule: str, **options):
+    """Register both direct service routes and gateway-style prefixed aliases."""
+    def decorator(func):
+        app.route(rule, **options)(func)
+        app.route(f"/{prefix}{rule}", **options)(func)
+        return func
+    return decorator
+
+db = create_sharded_redis()
 
 
 def close_db_connection():
@@ -131,7 +138,7 @@ def send_event(event: dict) -> bool:
     return True
 
 
-@app.post('/item/create/<price>')
+@service_route("stock", "/item/create/<price>", methods=["POST"])
 def create_item(price: int):
     key = str(uuid.uuid4())
     app.logger.debug(f"Item: {key} created")
@@ -143,21 +150,26 @@ def create_item(price: int):
     return jsonify({'item_id': key})
 
 
-@app.post('/batch_init/<n>/<starting_stock>/<item_price>')
+@service_route("stock", "/batch_init/<n>/<starting_stock>/<item_price>", methods=["POST"])
 def batch_init_users(n: int, starting_stock: int, item_price: int):
     n = int(n)
     starting_stock = int(starting_stock)
     item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
+    start_id = request.args.get("start_id", default=0, type=int)
+    kv_pairs: dict[str, bytes] = {f"{start_id + i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for stock successful"})
+    return jsonify({
+        "msg": "Batch init for stock successful",
+        "start_id": start_id,
+        "count": n,
+    })
 
 
-@app.get('/find/<item_id>')
+@service_route("stock", "/find/<item_id>", methods=["GET"])
 def find_item(item_id: str):
     item_entry: StockValue = get_item_from_db(item_id)
     return jsonify(
@@ -168,7 +180,7 @@ def find_item(item_id: str):
     )
 
 
-@app.get('/health')
+@service_route("stock", "/health", methods=["GET"])
 def health():
     try:
         db.ping()
@@ -177,7 +189,7 @@ def health():
     return Response("OK", status=200)
 
 
-@app.post('/add/<item_id>/<amount>')
+@service_route("stock", "/add/<item_id>/<amount>", methods=["POST"])
 def add_stock(item_id: str, amount: int):
     amount = int(amount)
     for _attempt in range(5):
@@ -198,7 +210,7 @@ def add_stock(item_id: str, amount: int):
     return abort(400, DB_ERROR_STR)
 
 
-@app.post('/subtract/<item_id>/<amount>')
+@service_route("stock", "/subtract/<item_id>/<amount>", methods=["POST"])
 def remove_stock(item_id: str, amount: int):
     amount = int(amount)
     for _attempt in range(5):
@@ -222,38 +234,23 @@ def remove_stock(item_id: str, amount: int):
     return abort(400, DB_ERROR_STR)
 
 
-def _reserve_stock(items: list[dict], reserved_key: str = None) -> tuple[bool, str]:
-    """Atomically subtract stock for all items and set idempotency marker."""
-    keys = [item["item_id"] for item in items]
-    retries = 3
-    while retries > 0:
-        retries -= 1
+def _reserve_single_item(item_id: str, quantity: int) -> tuple[bool, str]:
+    """Atomically subtract stock for a single item on its shard."""
+    for _retry in range(3):
         try:
-            with db.pipeline() as pipe:
-                pipe.watch(*keys)
-                entries: dict[str, StockValue] = {}
-                for item in items:
-                    item_id = item["item_id"]
-                    entry = _get_item_entry(item_id)
-                    if entry is None:
-                        pipe.unwatch()
-                        return False, f"Item {item_id} not found"
-                    entries[item_id] = entry
-                for item in items:
-                    item_id = item["item_id"]
-                    quantity = int(item["quantity"])
-                    if entries[item_id].stock - quantity < 0:
-                        pipe.unwatch()
-                        return False, f"Insufficient stock for {item_id}"
+            with db.pipeline(shard_hint=item_id) as pipe:
+                pipe.watch(item_id)
+                raw = pipe.get(item_id)
+                if not raw:
+                    pipe.unwatch()
+                    return False, f"Item {item_id} not found"
+                entry = msgpack.decode(raw, type=StockValue)
+                if entry.stock - quantity < 0:
+                    pipe.unwatch()
+                    return False, f"Insufficient stock for {item_id}"
+                entry.stock -= quantity
                 pipe.multi()
-                for item in items:
-                    item_id = item["item_id"]
-                    quantity = int(item["quantity"])
-                    entry = entries[item_id]
-                    entry.stock -= quantity
-                    pipe.set(item_id, msgpack.encode(entry))
-                if reserved_key:
-                    pipe.set(reserved_key, json.dumps(items), ex=IDEMPOTENCY_TTL)
+                pipe.set(item_id, msgpack.encode(entry))
                 pipe.execute()
                 return True, ""
         except redis.exceptions.WatchError:
@@ -261,43 +258,64 @@ def _reserve_stock(items: list[dict], reserved_key: str = None) -> tuple[bool, s
         except redis.exceptions.RedisError:
             return False, "DB error"
     return False, "Concurrent modification"
+
+
+def _rollback_single_item(item_id: str, quantity: int) -> None:
+    """Best-effort restore stock for a single item."""
+    for _retry in range(3):
+        try:
+            with db.pipeline(shard_hint=item_id) as pipe:
+                pipe.watch(item_id)
+                raw = pipe.get(item_id)
+                if not raw:
+                    return
+                entry = msgpack.decode(raw, type=StockValue)
+                entry.stock += quantity
+                pipe.multi()
+                pipe.set(item_id, msgpack.encode(entry))
+                pipe.execute()
+                return
+        except redis.exceptions.WatchError:
+            continue
+        except redis.exceptions.RedisError:
+            return
+
+
+def _reserve_stock(items: list[dict], reserved_key: str = None) -> tuple[bool, str]:
+    """Subtract stock for all items, one per shard-safe transaction."""
+    reserved: list[dict] = []
+    for item in items:
+        item_id = item["item_id"]
+        quantity = int(item["quantity"])
+        ok, reason = _reserve_single_item(item_id, quantity)
+        if not ok:
+            # rollback already-reserved items
+            for prev in reserved:
+                _rollback_single_item(prev["item_id"], int(prev["quantity"]))
+            return False, reason
+        reserved.append(item)
+    if reserved_key:
+        try:
+            db.set(reserved_key, json.dumps(items), ex=IDEMPOTENCY_TTL)
+        except redis.exceptions.RedisError:
+            pass
+    return True, ""
 
 
 def _rollback_stock(items: list[dict], rolled_key: str = None, reserved_key_to_delete: str = None) -> tuple[bool, str]:
-    """Atomically restore stock for all items and set rollback marker."""
-    keys = [item["item_id"] for item in items]
-    retries = 3
-    while retries > 0:
-        retries -= 1
-        try:
-            with db.pipeline() as pipe:
-                pipe.watch(*keys)
-                entries: dict[str, StockValue] = {}
-                for item in items:
-                    item_id = item["item_id"]
-                    entry = _get_item_entry(item_id)
-                    if entry is None:
-                        pipe.unwatch()
-                        return False, f"Item {item_id} not found"
-                    entries[item_id] = entry
-                pipe.multi()
-                for item in items:
-                    item_id = item["item_id"]
-                    quantity = int(item["quantity"])
-                    entry = entries[item_id]
-                    entry.stock += quantity
-                    pipe.set(item_id, msgpack.encode(entry))
-                if rolled_key:
-                    pipe.set(rolled_key, "1", ex=IDEMPOTENCY_TTL)
-                if reserved_key_to_delete:
-                    pipe.delete(reserved_key_to_delete)
-                pipe.execute()
-                return True, ""
-        except redis.exceptions.WatchError:
-            continue
-        except redis.exceptions.RedisError:
-            return False, "DB error"
-    return False, "Concurrent modification"
+    """Restore stock for all items, one per shard-safe transaction."""
+    for item in items:
+        item_id = item["item_id"]
+        quantity = int(item["quantity"])
+        _rollback_single_item(item_id, quantity)
+    try:
+        if rolled_key:
+            db.set(rolled_key, "1", ex=IDEMPOTENCY_TTL)
+        if reserved_key_to_delete:
+            db.delete(reserved_key_to_delete)
+    except redis.exceptions.RedisError:
+        pass
+    return True, ""
 
 
 def _handle_command(command: dict) -> None:

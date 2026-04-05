@@ -1,6 +1,8 @@
 version: "3"
 # Demo medium configuration: 50 total containers
-# Fixed infrastructure (6): gateway=1, order-db=1, stock-db=1, payment-db=1, zookeeper=1, kafka=1
+# Fixed infrastructure (14): gateway=1, order-db=3, stock-db=3, payment-db=3, zookeeper=1, kafka=1
+# Note: DB shards (order-db-1/2/3, stock-db-1/2/3, payment-db-1/2/3) are defined
+# in the base docker-compose.yml and do not need overrides here.
 # Scaled services (44): split as order-service=15, stock-service=15, payment-service=14
 # Usage: docker compose -f docker-compose.yml -f docker-compose.demo_medium.yml up -d
 
@@ -8,14 +10,14 @@ services:
   order-service:
     deploy:
       mode: replicated
-      replicas: 15
+      replicas: 14
 
   stock-service:
     deploy:
       mode: replicated
-      replicas: 15
+      replicas: 14
 
   payment-service:
     deploy:
       mode: replicated
-      replicas: 14
+      replicas: 13

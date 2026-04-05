@@ -8,14 +8,14 @@ services:
   order-service:
     deploy:
       mode: replicated
-      replicas: 28
+      replicas: 27
 
   stock-service:
     deploy:
       mode: replicated
-      replicas: 28
+      replicas: 27
 
   payment-service:
     deploy:
       mode: replicated
-      replicas: 28
+      replicas: 27

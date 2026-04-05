@@ -9,7 +9,8 @@ import uuid
 import redis
 
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from flask import Flask, jsonify, abort, Response, request
+from sharded_redis import create_sharded_redis
 try:
     from kafka import KafkaProducer, KafkaConsumer
     from kafka.errors import KafkaError, NoBrokersAvailable
@@ -37,10 +38,16 @@ IDEMPOTENCY_TTL = int(os.environ.get("IDEMPOTENCY_TTL", "3600"))
 
 app = Flask("payment-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+
+def service_route(prefix: str, rule: str, **options):
+    """Register both direct service routes and gateway-style prefixed aliases."""
+    def decorator(func):
+        app.route(rule, **options)(func)
+        app.route(f"/{prefix}{rule}", **options)(func)
+        return func
+    return decorator
+
+db = create_sharded_redis()
 
 
 def close_db_connection():
@@ -130,7 +137,7 @@ def send_event(event: dict) -> bool:
     return True
 
 
-@app.post('/create_user')
+@service_route("payment", "/create_user", methods=["POST"])
 def create_user():
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
@@ -141,20 +148,25 @@ def create_user():
     return jsonify({'user_id': key})
 
 
-@app.post('/batch_init/<n>/<starting_money>')
+@service_route("payment", "/batch_init/<n>/<starting_money>", methods=["POST"])
 def batch_init_users(n: int, starting_money: int):
     n = int(n)
     starting_money = int(starting_money)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
+    start_id = request.args.get("start_id", default=0, type=int)
+    kv_pairs: dict[str, bytes] = {f"{start_id + i}": msgpack.encode(UserValue(credit=starting_money))
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for users successful"})
+    return jsonify({
+        "msg": "Batch init for users successful",
+        "start_id": start_id,
+        "count": n,
+    })
 
 
-@app.get('/find_user/<user_id>')
+@service_route("payment", "/find_user/<user_id>", methods=["GET"])
 def find_user(user_id: str):
     user_entry: UserValue = get_user_from_db(user_id)
     return jsonify(
@@ -165,7 +177,7 @@ def find_user(user_id: str):
     )
 
 
-@app.get('/health')
+@service_route("payment", "/health", methods=["GET"])
 def health():
     try:
         db.ping()
@@ -174,7 +186,7 @@ def health():
     return Response("OK", status=200)
 
 
-@app.post('/add_funds/<user_id>/<amount>')
+@service_route("payment", "/add_funds/<user_id>/<amount>", methods=["POST"])
 def add_credit(user_id: str, amount: int):
     amount = int(amount)
     for _attempt in range(5):
@@ -195,7 +207,7 @@ def add_credit(user_id: str, amount: int):
     return abort(400, DB_ERROR_STR)
 
 
-@app.post('/pay/<user_id>/<amount>')
+@service_route("payment", "/pay/<user_id>/<amount>", methods=["POST"])
 def remove_credit(user_id: str, amount: int):
     amount = int(amount)
     for _attempt in range(5):
@@ -220,27 +232,32 @@ def remove_credit(user_id: str, amount: int):
 
 
 def _charge_payment(user_id: str, amount: int, charged_key: str) -> tuple[bool, str]:
-    """Atomically deduct credit and set the idempotency marker in one Redis transaction."""
+    """Deduct credit atomically on the user's shard, then set idempotency marker."""
     amount = int(amount)
     retries = 3
     while retries > 0:
         retries -= 1
         try:
-            with db.pipeline() as pipe:
+            with db.pipeline(shard_hint=user_id) as pipe:
                 pipe.watch(user_id)
-                user_entry = _get_user_entry(user_id)
-                if user_entry is None:
+                raw = pipe.get(user_id)
+                if not raw:
                     pipe.unwatch()
                     return False, "User not found"
+                user_entry = msgpack.decode(raw, type=UserValue)
                 user_entry.credit -= amount
                 if user_entry.credit < 0:
                     pipe.unwatch()
                     return False, "User out of credit"
                 pipe.multi()
                 pipe.set(user_id, msgpack.encode(user_entry))
-                pipe.set(charged_key, json.dumps({"user_id": user_id, "amount": amount}), ex=IDEMPOTENCY_TTL)
                 pipe.execute()
-                return True, ""
+            # idempotency marker (may be on a different shard)
+            try:
+                db.set(charged_key, json.dumps({"user_id": user_id, "amount": amount}), ex=IDEMPOTENCY_TTL)
+            except redis.exceptions.RedisError:
+                pass
+            return True, ""
         except redis.exceptions.WatchError:
             continue
         except redis.exceptions.RedisError:
@@ -249,25 +266,30 @@ def _charge_payment(user_id: str, amount: int, charged_key: str) -> tuple[bool, 
 
 
 def _rollback_payment(user_id: str, amount: int, rolled_key: str, charged_key: str) -> tuple[bool, str]:
-    """Atomically refund credit and set rollback marker in one Redis transaction."""
+    """Refund credit atomically on the user's shard, then update idempotency markers."""
     amount = int(amount)
     retries = 3
     while retries > 0:
         retries -= 1
         try:
-            with db.pipeline() as pipe:
+            with db.pipeline(shard_hint=user_id) as pipe:
                 pipe.watch(user_id)
-                user_entry = _get_user_entry(user_id)
-                if user_entry is None:
+                raw = pipe.get(user_id)
+                if not raw:
                     pipe.unwatch()
                     return False, "User not found"
+                user_entry = msgpack.decode(raw, type=UserValue)
                 user_entry.credit += amount
                 pipe.multi()
                 pipe.set(user_id, msgpack.encode(user_entry))
-                pipe.set(rolled_key, "1", ex=IDEMPOTENCY_TTL)
-                pipe.delete(charged_key)
                 pipe.execute()
-                return True, ""
+            # idempotency markers (may be on different shards)
+            try:
+                db.set(rolled_key, "1", ex=IDEMPOTENCY_TTL)
+                db.delete(charged_key)
+            except redis.exceptions.RedisError:
+                pass
+            return True, ""
         except redis.exceptions.WatchError:
             continue
         except redis.exceptions.RedisError:

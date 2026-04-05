@@ -47,15 +47,31 @@ services:
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      - order-db-1
+      - order-db-2
+      - order-db-3
       - kafka
 
-  order-db:
+  order-db-1:
     image: redis:7.2-bookworm
     restart: always
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     volumes:
-      - order-db-data:/data
+      - order-db-1-data:/data
+
+  order-db-2:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - order-db-2-data:/data
+
+  order-db-3:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - order-db-3-data:/data
 
   stock-service:
     build: ./stock
@@ -69,15 +85,31 @@ services:
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      - stock-db-1
+      - stock-db-2
+      - stock-db-3
       - kafka
 
-  stock-db:
+  stock-db-1:
     image: redis:7.2-bookworm
     restart: always
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     volumes:
-      - stock-db-data:/data
+      - stock-db-1-data:/data
+
+  stock-db-2:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - stock-db-2-data:/data
+
+  stock-db-3:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - stock-db-3-data:/data
 
   payment-service:
     build: ./payment
@@ -91,15 +123,31 @@ services:
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      - payment-db-1
+      - payment-db-2
+      - payment-db-3
       - kafka
 
-  payment-db:
+  payment-db-1:
     image: redis:7.2-bookworm
     restart: always
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     volumes:
-      - payment-db-data:/data
+      - payment-db-1-data:/data
+
+  payment-db-2:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - payment-db-2-data:/data
+
+  payment-db-3:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - payment-db-3-data:/data
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
@@ -125,6 +173,12 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
 volumes:
-  order-db-data:
-  stock-db-data:
-  payment-db-data:
+  order-db-1-data:
+  order-db-2-data:
+  order-db-3-data:
+  stock-db-1-data:
+  stock-db-2-data:
+  stock-db-3-data:
+  payment-db-1-data:
+  payment-db-2-data:
+  payment-db-3-data:
