@@ -1,4 +1,8 @@
-Darwin, , , :
+Darwin Morris, 4916344, D.B.Morris-1@student.tudelft.nl:
+  - Helped implement, debug, refactor SAGA
+  - Refactored service based orchestration (order service) into orchestrator model
+  - Assisted in debugging/building test suite
+  - Some deployment based tasks, kafka-ha etc.
 
 Cenker, , , :
 
