@@ -1,12 +1,12 @@
-Darwin, , :
+Darwin, , , :
 
-Cenker, , :
+Cenker, , , :
 
-Cem, , :
+Cem, , , :
 
-Dyujoy, , :
+Dyujoy, , , :
 
-Sadi Cagatayli, 5515777:
+Sadi Cagatayli, 5515777, S.Cagatayli-1@student.tudelft.nl:
   - Building a benchmarking suite (Focused more on correctness tests)
   - Helping in implementing of the Two Phase Commit
   - Helping in implementing of the Two Phase Commit with Kafka
