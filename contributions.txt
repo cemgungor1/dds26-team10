@@ -1,0 +1,14 @@
+Darwin, , :
+
+Cenker, , :
+
+Cem, , :
+
+Dyujoy, , :
+
+Sadi Cagatayli, 5515777:
+  - Building a benchmarking suite (Focused more on correctness tests)
+  - Helping in implementing of the Two Phase Commit
+  - Helping in implementing of the Two Phase Commit with Kafka
+  - Helping in implementing of the Two Phase Commit in Orchestrator
+  - Helping in debugging the Orchestrator with Correctness tests
