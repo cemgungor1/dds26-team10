@@ -1,26 +1,108 @@
 version: "3"
 # Demo medium configuration: 50 total containers
-# Fixed infrastructure (14): gateway=1, order-db=3, stock-db=3, payment-db=3, zookeeper=1, kafka=1
-# Note: DB shards (order-db-1/2/3, stock-db-1/2/3, payment-db-1/2/3) are defined
-# in the base docker-compose.yml and do not need overrides here.
-# Scaled services (44): split as order-service=15, stock-service=15, payment-service=14
+# Fixed infrastructure (8):
+# gateway=1, order-db=2, payment-db=2, stock-db=1, zookeeper=1, kafka=1
+# Scaled services (42):
+# order-service=14, stock-service=14, payment-service=14
 # Usage: docker compose -f docker-compose.yml -f docker-compose.demo_medium.yml up -d
 
 services:
   order-service:
+    environment:
+      REDIS_HOSTS: order-db-1:6379,order-db-2:6379
+    depends_on:
+      order-db-1:
+        condition: service_started
+      order-db-2:
+        condition: service_started
+      order-db-3:
+        condition: service_started
+        required: false
+      kafka:
+        condition: service_started
     deploy:
       mode: replicated
       replicas: 14
 
   stock-service:
+    environment:
+      REDIS_HOSTS: stock-db-1:6379
+    depends_on:
+      stock-db-1:
+        condition: service_started
+      stock-db-2:
+        condition: service_started
+        required: false
+      stock-db-3:
+        condition: service_started
+        required: false
+      kafka:
+        condition: service_started
     deploy:
       mode: replicated
       replicas: 14
 
   payment-service:
+    environment:
+      REDIS_HOSTS: payment-db-1:6379,payment-db-2:6379
+    depends_on:
+      payment-db-1:
+        condition: service_started
+      payment-db-2:
+        condition: service_started
+      payment-db-3:
+        condition: service_started
+        required: false
+      kafka:
+        condition: service_started
     deploy:
       mode: replicated
-      replicas: 13
+      replicas: 14
+
+  order-db-1:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  order-db-2:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  order-db-3:
+    deploy:
+      mode: replicated
+      replicas: 0
+
+  stock-db-1:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  stock-db-2:
+    deploy:
+      mode: replicated
+      replicas: 0
+
+  stock-db-3:
+    deploy:
+      mode: replicated
+      replicas: 0
+
+  payment-db-1:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  payment-db-2:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  payment-db-3:
+    deploy:
+      mode: replicated
+      replicas: 0
 
   kafka:
     environment:
