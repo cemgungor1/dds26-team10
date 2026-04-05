@@ -19,3 +19,7 @@ services:
     deploy:
       mode: replicated
       replicas: 28
+
+  kafka:
+    environment:
+      KAFKA_NUM_PARTITIONS: 30
