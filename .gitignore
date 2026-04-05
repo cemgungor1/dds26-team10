@@ -1,5 +1,7 @@
 .idea
 .DS_Store
+__pycache__/
+run.sh
 
 benchmarks/BCT/__pycache__/*
 benchmarks/BSCT/consistency-test/__pycache__/*

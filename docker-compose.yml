@@ -1,8 +1,26 @@
 version: "3"
+# Example scale up:
+# Usage: docker compose up -d --scale order-service=5 --scale stock-service=5 --scale payment-service=5 --scale orchestrator=5
+# For more convenient scaling, you can use override files:
+# Small configuration: 1 instance each (default)
+# Usage: docker compose -f docker-compose.yml -f docker-compose.small.yml up -d
+# Medium configuration: 3 instances each
+# Usage: docker compose -f docker-compose.yml -f docker-compose.medium.yml up -d
+# Large configuration: 5 instances each
+# Usage: docker compose -f docker-compose.yml -f docker-compose.large.yml up -d
+# Demo medium configuration: 50 total containers (custom split)
+# Usage: docker compose -f docker-compose.yml -f docker-compose.demo_medium.yml up -d
+# Demo large configuration: 90 total containers (custom split)
+# Usage: docker compose -f docker-compose.yml -f docker-compose.demo_large.yml up -d
+# XLarge configuration: 10 instances each
+# Usage: docker compose -f docker-compose.yml -f docker-compose.xlarge.yml up -d
+# XXLarge configuration: 20 instances each
+# Usage: docker compose -f docker-compose.yml -f docker-compose.xxlarge.yml up -d
 services:
 
   gateway:
     image: nginx:1.25-bookworm
+    restart: always
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -15,44 +33,126 @@ services:
   order-service:
     build: ./order
     image: order:latest
+    restart: always
     environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8001
       - STOCK_GRPC_HOST=stock-service
       - STOCK_GRPC_PORT=50051
       - PAYMENT_GRPC_HOST=payment-service
       - PAYMENT_GRPC_PORT=50052
       - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - KAFKA_BROKERS=kafka:29092
+      - TRANSACTION_MODE=saga
+      - SAGA_TIMEOUT_SECONDS=10
+    command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+      - orchestrator
+
+  orchestrator:
+    build: ./orchestrator
+    image: orchestrator:latest
+    restart: always
+    command: gunicorn -b 0.0.0.0:8001 -w 4 --timeout 30 --log-level=info app:app
+    environment:
+      - TPC_PROTOCOL=false
+      - KAFKA_BROKERS=kafka:29092
+      - STOCK_EVENT_TOPIC=stock-events
+      - PAYMENT_EVENT_TOPIC=payment-events
+      - TX_TIMEOUT_SECONDS=10
+      - RECOVERY_INTERVAL=5
+      - STALE_THRESHOLD=8
+      - REDIS_HOST=order-db
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+      - STOCK_GRPC_HOST=stock-service
+      - STOCK_GRPC_PORT=50051
+      - PAYMENT_GRPC_HOST=payment-service
+      - PAYMENT_GRPC_PORT=50052
+    depends_on:
+      - order-db
+      - kafka
+
 
   order-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - order-db-data:/data
 
   stock-service:
     build: ./stock
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    restart: always
+    command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - KAFKA_COMMAND_TOPIC=stock-commands
+      - KAFKA_EVENT_TOPIC=stock-events
     env_file:
       - env/stock_redis.env
     depends_on:
       - stock-db
+      - kafka
 
   stock-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - stock-db-data:/data
 
   payment-service:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    restart: always
+    command: gunicorn -c gunicorn.conf.py -b 0.0.0.0:5000 -w 4 --timeout 30 --log-level=info app:app
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - KAFKA_COMMAND_TOPIC=payment-commands
+      - KAFKA_EVENT_TOPIC=payment-events
     env_file:
       - env/payment_redis.env
     depends_on:
       - payment-db
+      - kafka
 
   payment-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    volumes:
+      - payment-db-data:/data
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    restart: always
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    ports:
+      - "9092:9092"
+    restart: always
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_NUM_PARTITIONS: 10
+
+volumes:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:

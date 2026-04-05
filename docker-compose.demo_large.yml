@@ -1,0 +1,26 @@
+version: "3"
+# Demo large configuration: 90 total containers
+# Fixed infrastructure (6): gateway=1, order-db=1, stock-db=1, payment-db=1, zookeeper=1, kafka=1
+# Scaled services (84): evenly split as order-service=21, stock-service=21, orchestrator=21, payment-service=21
+# Usage: docker compose -f docker-compose.yml -f docker-compose.demo_large.yml up -d
+
+services:
+  order-service:
+    deploy:
+      mode: replicated
+      replicas: 21
+
+  stock-service:
+    deploy:
+      mode: replicated
+      replicas: 21
+
+  payment-service:
+    deploy:
+      mode: replicated
+      replicas: 21
+
+  orchestrator:
+    deploy:
+      mode: replicated
+      replicas: 21

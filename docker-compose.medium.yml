@@ -1,0 +1,24 @@
+version: "3"
+# Medium configuration: 3 instances each
+# Usage: docker compose -f docker-compose.yml -f docker-compose.medium.yml up -d
+
+services:
+  order-service:
+    deploy:
+      mode: replicated
+      replicas: 3
+
+  stock-service:
+    deploy:
+      mode: replicated
+      replicas: 3
+
+  payment-service:
+    deploy:
+      mode: replicated
+      replicas: 3
+
+  orchestrator:
+    deploy:
+      mode: replicated
+      replicas: 3
