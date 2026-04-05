@@ -1,0 +1,109 @@
+version: "3"
+# Small configuration:
+# service replicas = 1 each
+# DB shards = 1 per service
+# Usage: docker compose -f docker-compose.yml -f docker-compose.small.yml up -d
+
+services:
+  order-service:
+    environment:
+      REDIS_HOSTS: order-db-1:6379,order-db-2:6379,order-db-3:6379
+    depends_on:
+      order-db-1:
+        condition: service_started
+      order-db-2:
+        condition: service_started
+        required: false
+      order-db-3:
+        condition: service_started
+        required: false
+      kafka:
+        condition: service_started
+    deploy:
+      mode: replicated
+      replicas: 6
+
+  stock-service:
+    environment:
+      REDIS_HOSTS: stock-db-1:6379,stock-db-2:6379,stock-db-3:6379
+    depends_on:
+      stock-db-1:
+        condition: service_started
+      stock-db-2:
+        condition: service_started
+        required: false
+      stock-db-3:
+        condition: service_started
+        required: false
+      kafka:
+        condition: service_started
+    deploy:
+      mode: replicated
+      replicas: 6
+
+  payment-service:
+    environment:
+      REDIS_HOSTS: payment-db-1:6379,payment-db-2:6379,payment-db-3:6379
+    depends_on:
+      payment-db-1:
+        condition: service_started
+      payment-db-2:
+        condition: service_started
+        required: false
+      payment-db-3:
+        condition: service_started
+        required: false
+      kafka:
+        condition: service_started
+    deploy:
+      mode: replicated
+      replicas: 6
+
+  order-db-1:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  order-db-2:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  order-db-3:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  stock-db-1:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  stock-db-2:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  stock-db-3:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  payment-db-1:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  payment-db-2:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  payment-db-3:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  kafka:
+    environment:
+      KAFKA_NUM_PARTITIONS: 50
