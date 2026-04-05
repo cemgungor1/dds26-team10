@@ -1,0 +1,24 @@
+version: "3"
+# XLarge configuration: 10 instances each
+# Usage: docker compose -f docker-compose.yml -f docker-compose.xlarge.yml up -d
+
+services:
+  order-service:
+    deploy:
+      mode: replicated
+      replicas: 10
+
+  stock-service:
+    deploy:
+      mode: replicated
+      replicas: 10
+
+  payment-service:
+    deploy:
+      mode: replicated
+      replicas: 10
+
+  orchestrator:
+    deploy:
+      mode: replicated
+      replicas: 10

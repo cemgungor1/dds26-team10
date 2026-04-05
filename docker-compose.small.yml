@@ -1,0 +1,25 @@
+version: "3"
+# Small configuration: 1 instance each (default)
+# Usage: docker compose -f docker-compose.yml -f docker-compose.small.yml up -d
+
+services:
+  order-service:
+    # Single instance (default behavior)
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  stock-service:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  payment-service:
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  orchestrator:
+    deploy:
+      mode: replicated
+      replicas: 1

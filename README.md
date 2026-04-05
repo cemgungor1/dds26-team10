@@ -30,8 +30,85 @@ Basic project structure with Python's Flask and Redis.
 
 #### docker-compose (local development)
 
-After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct
+After coding the REST endpoint logic run `docker compose up --build` in the base folder to test if your logic is correct
 (you can use the provided tests in the `\test` folder and change them as you wish). 
+
+##### Docker Compose size configurations
+
+Use these exact commands from the repository root:
+
+Default (base file):
+
+```bash
+docker compose up --build
+```
+
+Small (1 replica for `order-service`, `stock-service`, `payment-service`, `orchestrator`):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.small.yml up -d --build
+```
+
+Medium (3 replicas each):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.medium.yml up -d
+```
+
+Large (5 replicas each):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.large.yml up -d
+```
+
+Demo Medium (50 total containers):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.demo_medium.yml up -d --build
+```
+
+Demo Large (90 total containers):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.demo_large.yml up -d --build
+```
+
+Unix/Linux/macOS helper script:
+
+```bash
+chmod +x run-demo-scaling.sh
+```
+
+```bash
+./run-demo-scaling.sh small
+./run-demo-scaling.sh medium
+./run-demo-scaling.sh large
+```
+
+The script includes `--build` in all three Docker Compose commands.
+
+Demo allocation details:
+- Fixed infrastructure (6 containers): `gateway=1`, `order-db=1`, `stock-db=1`, `payment-db=1`, `zookeeper=1`, `kafka=1`
+- Demo Medium scaled services (44 containers, even split): `order-service=11`, `stock-service=11`, `orchestrator=11`, `payment-service=11`
+- Demo Large scaled services (84 containers, even split): `order-service=21`, `stock-service=21`, `orchestrator=21`, `payment-service=21`
+
+XLarge (10 replicas each):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.xlarge.yml up -d
+```
+
+XXLarge (20 replicas each):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.xxlarge.yml up -d
+```
+
+Optional manual scaling example:
+
+```bash
+docker compose up -d --scale order-service=5 --scale stock-service=5 --scale payment-service=5 --scale orchestrator=5
+```
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 
