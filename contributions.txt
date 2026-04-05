@@ -4,7 +4,11 @@ Darwin Morris, 4916344, D.B.Morris-1@student.tudelft.nl:
   - Assisted in debugging/building test suite
   - Some deployment based tasks, kafka-ha etc.
 
-Cenker, , , :
+Ali Cenker Yakisir, 6507794, cyakisir@tudelft.nl:
+- Implemented the inital log first saga architechture and its recovery methods 
+- Implemented partioning for redis
+- Improved Saga architechture based on the test results
+- Tried to optimize orchestrator architechture
 
 Cem Gungor, 6500617, C.Gungor@student.tudelft.nl:
   - Helped implement redis sentinels for highly available redis
