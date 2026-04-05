@@ -82,7 +82,8 @@ class StockServicer(services_pb2_grpc.StockServiceServicer):
         context.abort(grpc.StatusCode.INTERNAL, DB_ERROR_STR)
 
 def serve():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10),
+                         options=[('grpc.so_reuseport', 1)])
     services_pb2_grpc.add_StockServiceServicer_to_server(StockServicer(), server)
     server.add_insecure_port("[::]:50051")
     server.start()
