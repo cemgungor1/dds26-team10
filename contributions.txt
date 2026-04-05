@@ -8,7 +8,12 @@ Cenker, , , :
 
 Cem, , , :
 
-Dyujoy, , , :
+Dyujoy, 6497462, dyujoymajumdar@tudelft.nl:
+  - Helped in implementing the Two Phase Commit in the first phase
+    - Added the pessimistic two phase commit 
+  - Helped in implementing the Two Phase Commit in the Second phase
+    - Moved away from grpc to kafka 
+  - Helped in the debugging/building/testing etc.
 
 Sadi Cagatayli, 5515777, S.Cagatayli-1@student.tudelft.nl:
   - Building a benchmarking suite (Focused more on correctness tests)
