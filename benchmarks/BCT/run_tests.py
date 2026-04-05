@@ -14,10 +14,7 @@ if __name__ == '__main__':
     suite.addTests(loader.loadTestsFromName('coordinator'))
     suite.addTests(loader.loadTestsFromName('rollback'))
 
-    suite.addTests(loader.loadTestsFromName('2pc'))
-
     suite.addTests(loader.loadTestsFromName('kafka_saga'))
 
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)
-

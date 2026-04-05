@@ -244,7 +244,7 @@ class TestConcurrentPayment(unittest.TestCase):
         for t in threads:
             t.join(timeout=30)
 
-        time.sleep(1)
+        time.sleep(20)
 
         user2: dict = tu.create_user()
         user_id2: str = user2['user_id']

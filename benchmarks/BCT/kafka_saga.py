@@ -314,7 +314,7 @@ class TestKafkaConsumerGroups(unittest.TestCase):
         producer.flush()
         producer.close()
 
-        time.sleep(0.5)  # let broker settle
+        time.sleep(20)  # let broker settle
 
         consumer = _make_consumer(topic)  # always uses earliest + new group
         messages = _drain(consumer, max_messages=4)
@@ -397,13 +397,23 @@ class TestKafkaSagaMessageSchema(unittest.TestCase):
     STOCK_EVENTS     = "stock-events"
 
     def _send_and_receive(self, topic: str, payload: dict) -> dict:
+
+        # Create isolated topic
+        isolated_topic = _unique_topic(f"schema-test-{topic}")
+        _create_topic(isolated_topic)
+
+        # Create consumer
+        consumer = _make_consumer(isolated_topic)
+        #consumer.poll(timeout_ms=100)
+        #consumer.seek_to_end()
+
         # Produces one message to a topic, immediately consumes it back
         producer = _make_producer()
-        producer.send(topic, value=payload)
+        producer.send(isolated_topic, value=payload)
         producer.flush()
         producer.close()
 
-        consumer = _make_consumer(topic)
+        #consumer = _make_consumer(topic)
         messages = _drain(consumer, max_messages=1)
         consumer.close()
         return messages[0].value

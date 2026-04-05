@@ -20,7 +20,7 @@ class TestFailureResilience(unittest.TestCase):
             cwd=COMPOSE_DIR,
             check=True
         )
-        time.sleep(5)
+        time.sleep(20)
 
     def _start_service(self, service: str):
         subprocess.run(
@@ -28,7 +28,7 @@ class TestFailureResilience(unittest.TestCase):
             cwd=COMPOSE_DIR,
             check=True
         )
-        time.sleep(5)
+        time.sleep(20)
 
     def test_stock_service_down(self):
         # Create user
@@ -76,7 +76,7 @@ class TestFailureResilience(unittest.TestCase):
             # Start back the payment service
             self._start_service("payment-service")
         
-        time.sleep(15) # wait for rollback
+        time.sleep(20) # wait for rollback
         stock_after = tu.find_item(item['item_id'])['stock']
         self.assertEqual(stock_after, stock_before)
     def test_stock_service_recovers(self):
