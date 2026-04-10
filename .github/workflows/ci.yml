@@ -3,7 +3,7 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [kafka-saga-v2]
+    branches:
   pull_request:
 
 jobs:

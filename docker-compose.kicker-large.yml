@@ -21,11 +21,11 @@ services:
         condition: service_started
     deploy:
       mode: replicated
-      replicas: 8
+      replicas: 14
 
   stock-service:
     environment:
-      REDIS_HOSTS: stock-db-1:6379,stock-db-2:6379
+      REDIS_HOSTS: stock-db-1:6379,stock-db-2:6379,stock-db-3:6379
     depends_on:
       stock-db-1:
         condition: service_started
@@ -39,11 +39,11 @@ services:
         condition: service_started
     deploy:
       mode: replicated
-      replicas: 6
+      replicas: 8
 
   payment-service:
     environment:
-      REDIS_HOSTS: payment-db-1:6379,payment-db-2:6379
+      REDIS_HOSTS: payment-db-1:6379,payment-db-2:6379,stock-db-3:6379
     depends_on:
       payment-db-1:
         condition: service_started
@@ -57,7 +57,7 @@ services:
         condition: service_started
     deploy:
       mode: replicated
-      replicas: 6
+      replicas: 8
 
   order-db-1:
     deploy:
@@ -87,7 +87,7 @@ services:
   stock-db-3:
     deploy:
       mode: replicated
-      replicas: 0
+      replicas: 1
 
   payment-db-1:
     deploy:
@@ -102,8 +102,8 @@ services:
   payment-db-3:
     deploy:
       mode: replicated
-      replicas: 0
+      replicas: 1
 
   kafka:
     environment:
-      KAFKA_NUM_PARTITIONS: 10
+      KAFKA_NUM_PARTITIONS: 14
